@@ -126,7 +126,7 @@ def extract_url_components(url: str) -> dict:
         'base_url': get_base_url(url)
     }
 
-def get_link_latency(page, link, load_state="load"):
+def get_link_latency(browser, page, link, load_state="load"):
     """
     测试单个链接的访问延迟
     :param page: Playwright的page对象（用于新标签页访问）
@@ -139,7 +139,7 @@ def get_link_latency(page, link, load_state="load"):
         # 记录开始时间戳（发起请求前）
         start_time = time.time()
         # 打开新标签页访问链接（避免影响原页面）
-        with page.context.new_page() as new_page:
+        with browser.new_context().new_page() as new_page:
             # 访问链接 + 等待指定加载状态（延迟结束的判断标准）
             new_page.goto(link, wait_until=load_state)
             # 记录结束时间戳
