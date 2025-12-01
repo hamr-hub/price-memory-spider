@@ -272,6 +272,59 @@ def product_prices(product_id: int, start_date: Optional[str] = None, end_date: 
     conn.close()
     return ok(items)
 
+@router.get("/products/{product_id}/trend")
+def product_trend(product_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None, granularity: Optional[str] = "daily"):
+    p = get_product(product_id)
+    if not p:
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    if granularity not in {"daily"}:
+        return error_response(400, "VALIDATION_ERROR", "不支持的粒度")
+    conn = get_conn()
+    cur = conn.cursor()
+    where = ["product_id = ?"]
+    params: List[Any] = [product_id]
+    if start_date:
+        where.append("substr(created_at,1,10) >= ?")
+        params.append(start_date)
+    if end_date:
+        where.append("substr(created_at,1,10) <= ?")
+        params.append(end_date)
+    # 按天聚合，计算OHLC与平均值
+    cur.execute(
+        """
+        WITH days AS (
+            SELECT DISTINCT substr(created_at,1,10) AS day
+            FROM prices
+            WHERE product_id = ?
+        )
+        SELECT d.day AS date,
+               (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,10) = d.day ORDER BY created_at ASC LIMIT 1) AS open,
+               (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,10) = d.day ORDER BY created_at DESC LIMIT 1) AS close,
+               MIN(p.price) AS low,
+               MAX(p.price) AS high,
+               AVG(p.price) AS avg,
+               COUNT(1) AS count
+        FROM days d
+        JOIN prices p ON p.product_id = ? AND substr(p.created_at,1,10) = d.day
+        GROUP BY d.day
+        ORDER BY d.day ASC
+        """,
+        [product_id, product_id, product_id, product_id],
+    )
+    series = []
+    for r in cur.fetchall():
+        series.append({
+            "date": r[0],
+            "open": r[1],
+            "close": r[2],
+            "low": r[3],
+            "high": r[4],
+            "avg": r[5],
+            "count": r[6],
+        })
+    conn.close()
+    return ok({"granularity": granularity, "series": series})
+
 @router.get("/products/{product_id}/export")
 def export_product_prices(product_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None, api_key: Optional[str] = None):
     p = get_product(product_id)
@@ -714,6 +767,8 @@ def execute_task(task_id: int):
     cur.execute("UPDATE tasks SET status = 'running', updated_at = ?, started_at = ? WHERE id = ?", (now, now, task_id))
     # 写入价格并完成任务
     cur.execute("INSERT INTO prices(product_id, price, created_at) VALUES(?, ?, ?)", (pid, 99.0, now))
+    # 维护产品最近更新时间
+    cur.execute("UPDATE products SET last_updated = ? WHERE id = ?", (now, pid))
     cur.execute("UPDATE tasks SET status = 'completed', updated_at = ?, completed_at = ? WHERE id = ?", (now, now, task_id))
     conn.commit()
     cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
