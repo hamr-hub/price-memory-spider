@@ -2,6 +2,7 @@ import os
 import sqlite3
 import math
 import datetime
+import random
 from typing import Any, List, Optional, Dict
 from fastapi import FastAPI, APIRouter, Query, Header
 from fastapi.responses import Response
@@ -47,6 +48,7 @@ def init_db():
     # ensure commercial columns
     ensure_user_commercial_columns(conn)
     ensure_task_columns(conn)
+    ensure_alerts_table(conn)
     # ensure default public pool
     try:
         cur.execute("INSERT INTO pools(name, is_public) VALUES(?, ?)", ("public", 1))
@@ -81,6 +83,11 @@ def ensure_task_columns(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
     if "result_message" not in cols:
         cur.execute("ALTER TABLE tasks ADD COLUMN result_message TEXT")
+    conn.commit()
+
+def ensure_alerts_table(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, rule_type TEXT NOT NULL, threshold REAL, percent REAL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     conn.commit()
 
 def get_user_by_api_key(api_key: Optional[str]) -> Optional[sqlite3.Row]:
@@ -177,6 +184,16 @@ class CollectionAddProduct(BaseModel):
 class CollectionShare(BaseModel):
     user_id: int
     role: Optional[str] = "editor"
+
+class AlertCreate(BaseModel):
+    user_id: int
+    product_id: int
+    rule_type: str
+    threshold: Optional[float] = None
+    percent: Optional[float] = None
+
+class AlertStatusUpdate(BaseModel):
+    status: str
 
 app = FastAPI()
 router = APIRouter(prefix="/api/v1")
@@ -639,6 +656,66 @@ def export_collection_xlsx(collection_id: int, api_key: Optional[str] = None, st
     conn.close()
     return Response(content=bio.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
+@router.get("/alerts")
+def list_alerts(user_id: Optional[int] = None, product_id: Optional[int] = None):
+    conn = get_conn()
+    cur = conn.cursor()
+    where = []
+    params: List[Any] = []
+    if user_id is not None:
+        where.append("user_id = ?")
+        params.append(user_id)
+    if product_id is not None:
+        where.append("product_id = ?")
+        params.append(product_id)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    cur.execute(f"SELECT * FROM alerts {where_sql} ORDER BY id DESC", params)
+    items = [{"id": r["id"], "user_id": r["user_id"], "product_id": r["product_id"], "rule_type": r["rule_type"], "threshold": r["threshold"], "percent": r["percent"], "status": r["status"], "created_at": r["created_at"], "updated_at": r["updated_at"]} for r in cur.fetchall()]
+    conn.close()
+    return ok(items)
+
+@router.post("/alerts")
+def create_alert(body: AlertCreate):
+    now = now_iso()
+    if body.rule_type not in {"price_lte"}:
+        return error_response(400, "VALIDATION_ERROR", "规则类型无效")
+    if not get_product(body.product_id):
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO alerts(user_id, product_id, rule_type, threshold, percent, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (body.user_id, body.product_id, body.rule_type, body.threshold, body.percent, "active", now, now))
+    conn.commit()
+    cur.execute("SELECT * FROM alerts WHERE id = last_insert_rowid()")
+    r = cur.fetchone()
+    conn.close()
+    return ok({"id": r["id"], "user_id": r["user_id"], "product_id": r["product_id"], "rule_type": r["rule_type"], "threshold": r["threshold"], "percent": r["percent"], "status": r["status"], "created_at": r["created_at"], "updated_at": r["updated_at"]})
+
+@router.post("/alerts/{alert_id}/status")
+def update_alert_status(alert_id: int, body: AlertStatusUpdate):
+    if body.status not in {"active", "paused"}:
+        return error_response(400, "VALIDATION_ERROR", "状态无效")
+    now = now_iso()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE alerts SET status = ?, updated_at = ? WHERE id = ?", (body.status, now, alert_id))
+    conn.commit()
+    cur.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    conn.close()
+    return ok({"id": r["id"], "user_id": r["user_id"], "product_id": r["product_id"], "rule_type": r["rule_type"], "threshold": r["threshold"], "percent": r["percent"], "status": r["status"], "created_at": r["created_at"], "updated_at": r["updated_at"]})
+
+@router.delete("/alerts/{alert_id}")
+def delete_alert(alert_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+    conn.commit()
+    conn.close()
+    return ok({"id": alert_id})
+
 @router.get("/users/{user_id}/follows")
 def list_user_follows(user_id: int):
     conn = get_conn()
@@ -765,9 +842,17 @@ def execute_task(task_id: int):
         return error_response(404, "NOT_FOUND", "资源不存在")
     now = now_iso()
     cur.execute("UPDATE tasks SET status = 'running', updated_at = ?, started_at = ? WHERE id = ?", (now, now, task_id))
-    # 写入价格并完成任务
-    cur.execute("INSERT INTO prices(product_id, price, created_at) VALUES(?, ?, ?)", (pid, 99.0, now))
-    # 维护产品最近更新时间
+    cur.execute("SELECT price, created_at FROM prices WHERE product_id = ? ORDER BY created_at DESC LIMIT 1", (pid,))
+    rlast = cur.fetchone()
+    last_price = float(rlast[0]) if rlast else None
+    base = last_price if last_price is not None else random.uniform(50.0, 200.0)
+    price = round(base * (1 + random.uniform(-0.03, 0.03)), 2)
+    cur.execute("SELECT price, substr(created_at,1,16) AS m FROM prices WHERE product_id = ? ORDER BY created_at DESC LIMIT 1", (pid,))
+    prev = cur.fetchone()
+    curr_minute = now[:16]
+    if not prev or not (float(prev[0]) == price and str(prev[1]) == curr_minute):
+        cur.execute("INSERT INTO prices(product_id, price, created_at) VALUES(?, ?, ?)", (pid, price, now))
+        evaluate_alerts_for_product(cur, pid, price, now)
     cur.execute("UPDATE products SET last_updated = ? WHERE id = ?", (now, pid))
     cur.execute("UPDATE tasks SET status = 'completed', updated_at = ?, completed_at = ? WHERE id = ?", (now, now, task_id))
     conn.commit()
@@ -775,6 +860,18 @@ def execute_task(task_id: int):
     t2 = cur.fetchone()
     conn.close()
     return ok({"id": t2["id"], "product_id": t2["product_id"], "status": t2["status"], "created_at": t2["created_at"], "updated_at": t2["updated_at"]})
+
+def evaluate_alerts_for_product(cur: sqlite3.Cursor, product_id: int, price: float, now: str):
+    cur.execute("SELECT id, user_id, rule_type, threshold, percent FROM alerts WHERE product_id = ? AND status = 'active'", (product_id,))
+    for a in cur.fetchall():
+        rt = a[2]
+        th = a[3]
+        uid = a[1]
+        trig = False
+        if rt == "price_lte" and th is not None and price <= float(th):
+            trig = True
+        if trig:
+            cur.execute("INSERT INTO pushes(sender_id, recipient_id, product_id, message, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)", (0, uid, product_id, f"价格触发: {price}", "pending", now, now))
 
 @router.post("/spider/listing")
 def listing(body: ListingRequest):
