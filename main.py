@@ -3,13 +3,16 @@ import sqlite3
 import math
 import datetime
 from typing import Any, List, Optional
-from fastapi import FastAPI, APIRouter, Query
+from fastapi import FastAPI, APIRouter, Query, Header
 from fastapi.responses import Response
+import secrets
 from pydantic import BaseModel
 import sys
 
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "spider.db")
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -35,6 +38,48 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS user_follows (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(user_id, product_id))")
     cur.execute("CREATE TABLE IF NOT EXISTS pushes (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, product_id INTEGER NOT NULL, message TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     conn.commit()
+    # ensure commercial columns
+    ensure_user_commercial_columns(conn)
+    conn.close()
+
+def ensure_user_commercial_columns(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()}
+    if "api_key" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN api_key TEXT")
+    if "plan" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN plan TEXT")
+    if "quota_exports_per_day" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN quota_exports_per_day INTEGER")
+    if "exports_used_today" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN exports_used_today INTEGER")
+    if "last_quota_reset" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_quota_reset TEXT")
+    conn.commit()
+
+def get_user_by_api_key(api_key: Optional[str]) -> Optional[sqlite3.Row]:
+    if not api_key:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE api_key = ?", (api_key,))
+    r = cur.fetchone()
+    conn.close()
+    return r
+
+def reset_user_quota_if_needed(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT exports_used_today, last_quota_reset FROM users WHERE id = ?", (user_id,))
+    r = cur.fetchone()
+    today = datetime.datetime.utcnow().date().isoformat()
+    if not r:
+        conn.close()
+        return
+    last = r[1]
+    if last != today:
+        cur.execute("UPDATE users SET exports_used_today = 0, last_quota_reset = ? WHERE id = ?", (today, user_id))
+        conn.commit()
     conn.close()
 
 def row_to_product(r: sqlite3.Row) -> dict:
@@ -184,10 +229,17 @@ def product_prices(product_id: int, start_date: Optional[str] = None, end_date: 
     return ok(items)
 
 @router.get("/products/{product_id}/export")
-def export_product_prices(product_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None):
+def export_product_prices(product_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None, api_key: Optional[str] = None):
     p = get_product(product_id)
     if not p:
         return error_response(404, "NOT_FOUND", "资源不存在")
+    user = get_user_by_api_key(api_key)
+    if user:
+        reset_user_quota_if_needed(user["id"])
+        quota = user["quota_exports_per_day"] or 0
+        used = user["exports_used_today"] or 0
+        if quota and used >= quota:
+            return error_response(429, "QUOTA_EXCEEDED", "导出额度已用尽")
     conn = get_conn()
     cur = conn.cursor()
     where = ["product_id = ?"]
@@ -210,6 +262,12 @@ def export_product_prices(product_id: int, start_date: Optional[str] = None, end
         writer.writerow([product_id, p["name"], p["url"], p["category"], r["id"], r["price"], r["created_at"]])
     csv_content = output.getvalue()
     filename = f"product_{product_id}_prices.csv"
+    if user:
+        conn2 = get_conn()
+        cur2 = conn2.cursor()
+        cur2.execute("UPDATE users SET exports_used_today = COALESCE(exports_used_today, 0) + 1 WHERE id = ?", (user["id"],))
+        conn2.commit()
+        conn2.close()
     return Response(content=csv_content, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @router.post("/users")
@@ -218,16 +276,20 @@ def create_user(body: UserCreate):
     conn = get_conn()
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO users(username, display_name, created_at) VALUES(?, ?, ?)", (body.username, body.display_name, now))
+        api_key = secrets.token_hex(16)
+        plan = "basic"
+        quota_exports = 5
+        today = datetime.datetime.utcnow().date().isoformat()
+        cur.execute("INSERT INTO users(username, display_name, created_at, api_key, plan, quota_exports_per_day, exports_used_today, last_quota_reset) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (body.username, body.display_name, now, api_key, plan, quota_exports, 0, today))
         conn.commit()
         uid = cur.lastrowid
     except sqlite3.IntegrityError:
         conn.close()
         return error_response(400, "VALIDATION_ERROR", "用户名已存在")
-    cur.execute("SELECT id, username, display_name, created_at FROM users WHERE id = ?", (uid,))
+    cur.execute("SELECT id, username, display_name, created_at, api_key, plan, quota_exports_per_day FROM users WHERE id = ?", (uid,))
     r = cur.fetchone()
     conn.close()
-    return ok({"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3]})
+    return ok({"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3], "api_key": r[4], "plan": r[5], "quota_exports_per_day": r[6]})
 
 @router.get("/users")
 def list_users(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None):
@@ -422,6 +484,43 @@ def listing(body: ListingRequest):
     limit = max(1, min(body.max_items, 50))
     items = [{"title": f"Item {i+1}", "url": body.url, "source": base} for i in range(limit)]
     return ok({"count": len(items), "items": items})
+
+@router.get("/export")
+def export_products(product_ids: str, api_key: Optional[str] = None):
+    ids = [int(x) for x in product_ids.split(",") if x.strip().isdigit()]
+    if not ids:
+        return error_response(400, "VALIDATION_ERROR", "缺少有效的product_ids")
+    user = get_user_by_api_key(api_key)
+    if user:
+        reset_user_quota_if_needed(user["id"])
+        quota = user["quota_exports_per_day"] or 0
+        used = user["exports_used_today"] or 0
+        if quota and used >= quota:
+            return error_response(429, "QUOTA_EXCEEDED", "导出额度已用尽")
+    import csv
+    import io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["product_id", "product_name", "url", "category", "price_id", "price", "created_at"])
+    conn = get_conn()
+    cur = conn.cursor()
+    for pid in ids:
+        p = get_product(pid)
+        if not p:
+            continue
+        cur.execute("SELECT id, price, created_at FROM prices WHERE product_id = ? ORDER BY created_at DESC", (pid,))
+        for r in cur.fetchall():
+            writer.writerow([pid, p["name"], p["url"], p["category"], r["id"], r["price"], r["created_at"]])
+    conn.close()
+    csv_content = output.getvalue()
+    filename = "products_export.csv"
+    if user:
+        conn2 = get_conn()
+        cur2 = conn2.cursor()
+        cur2.execute("UPDATE users SET exports_used_today = COALESCE(exports_used_today, 0) + 1 WHERE id = ?", (user["id"],))
+        conn2.commit()
+        conn2.close()
+    return Response(content=csv_content, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 app.include_router(router)
 

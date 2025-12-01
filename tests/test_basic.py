@@ -1,7 +1,7 @@
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-from spider.main import init_db, create_product, get_product, get_conn, system_status, create_task, execute_task, listing, TaskCreate, ListingRequest, export_product_prices
+from spider.main import init_db, create_product, get_product, get_conn, system_status, create_task, execute_task, listing, TaskCreate, ListingRequest, export_product_prices, export_products
 
 
 def test_init_db_and_create_product():
@@ -53,3 +53,20 @@ def test_export_csv_contains_header():
     assert getattr(resp, "media_type", None) == "text/csv"
     filename = resp.headers.get("content-disposition", "")
     assert "product_" in filename
+
+
+def test_multi_export_csv_contains_multiple_products():
+    init_db()
+    pid1 = create_product("商品C", "http://example.com/c", "类目")
+    pid2 = create_product("商品D", "http://example.com/d", "类目")
+    body1 = TaskCreate(product_id=pid1)
+    body2 = TaskCreate(product_id=pid2)
+    t1 = create_task(body1)["data"]["id"]
+    t2 = create_task(body2)["data"]["id"]
+    execute_task(t1)
+    execute_task(t2)
+    resp = export_products(f"{pid1},{pid2}")
+    content = getattr(resp, "body", None) or resp.body
+    assert getattr(resp, "media_type", None) == "text/csv"
+    assert "商品C".encode("utf-8") in content
+    assert "商品D".encode("utf-8") in content
