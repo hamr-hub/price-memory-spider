@@ -2,7 +2,7 @@ import os
 import sqlite3
 import math
 import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
 from fastapi import FastAPI, APIRouter, Query, Header
 from fastapi.responses import Response
 import secrets
@@ -33,13 +33,26 @@ def init_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL, category TEXT, last_updated TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS prices (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, price REAL NOT NULL, created_at TEXT NOT NULL)")
-    cur.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, scheduled_at TEXT, started_at TEXT, completed_at TEXT, result_message TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, display_name TEXT, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS user_follows (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(user_id, product_id))")
     cur.execute("CREATE TABLE IF NOT EXISTS pushes (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, product_id INTEGER NOT NULL, message TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    # collaboration tables
+    cur.execute("CREATE TABLE IF NOT EXISTS pools (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, is_public INTEGER NOT NULL DEFAULT 0)")
+    cur.execute("CREATE TABLE IF NOT EXISTS pool_products (id INTEGER PRIMARY KEY AUTOINCREMENT, pool_id INTEGER NOT NULL, product_id INTEGER NOT NULL, UNIQUE(pool_id, product_id))")
+    cur.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, owner_user_id INTEGER NOT NULL, created_at TEXT NOT NULL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS collection_products (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, product_id INTEGER NOT NULL, UNIQUE(collection_id, product_id))")
+    cur.execute("CREATE TABLE IF NOT EXISTS collection_members (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'editor', UNIQUE(collection_id, user_id))")
     conn.commit()
     # ensure commercial columns
     ensure_user_commercial_columns(conn)
+    ensure_task_columns(conn)
+    # ensure default public pool
+    try:
+        cur.execute("INSERT INTO pools(name, is_public) VALUES(?, ?)", ("public", 1))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
     conn.close()
 
 def ensure_user_commercial_columns(conn: sqlite3.Connection):
@@ -55,6 +68,19 @@ def ensure_user_commercial_columns(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE users ADD COLUMN exports_used_today INTEGER")
     if "last_quota_reset" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN last_quota_reset TEXT")
+    conn.commit()
+
+def ensure_task_columns(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "scheduled_at" not in cols:
+        cur.execute("ALTER TABLE tasks ADD COLUMN scheduled_at TEXT")
+    if "started_at" not in cols:
+        cur.execute("ALTER TABLE tasks ADD COLUMN started_at TEXT")
+    if "completed_at" not in cols:
+        cur.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
+    if "result_message" not in cols:
+        cur.execute("ALTER TABLE tasks ADD COLUMN result_message TEXT")
     conn.commit()
 
 def get_user_by_api_key(api_key: Optional[str]) -> Optional[sqlite3.Row]:
@@ -135,8 +161,26 @@ class PushCreate(BaseModel):
 class PushUpdate(BaseModel):
     status: str
 
+class PoolAddProduct(BaseModel):
+    product_id: int
+
+class SelectFromPoolBody(BaseModel):
+    product_id: int
+
+class CollectionCreate(BaseModel):
+    name: str
+    owner_user_id: int
+
+class CollectionAddProduct(BaseModel):
+    product_id: int
+
+class CollectionShare(BaseModel):
+    user_id: int
+    role: Optional[str] = "editor"
+
 app = FastAPI()
 router = APIRouter(prefix="/api/v1")
+RATE_LIMIT: Dict[str, float] = {}
 
 @app.on_event("startup")
 def on_startup():
@@ -334,6 +378,214 @@ def product_followers(product_id: int):
     conn.close()
     return ok(items)
 
+@router.get("/pools/public/products")
+def list_public_pool_products(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100)):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM pools WHERE is_public = 1 LIMIT 1")
+    pool = cur.fetchone()
+    if not pool:
+        conn.close()
+        return ok({"items": [], "page": page, "size": size, "total": 0, "pages": 0})
+    pool_id = pool[0]
+    total = cur.execute("SELECT COUNT(*) FROM pool_products WHERE pool_id = ?", (pool_id,)).fetchone()[0]
+    offset = (page - 1) * size
+    cur.execute(
+        "SELECT p.id, p.name, p.url, p.category, p.last_updated FROM pool_products pp JOIN products p ON pp.product_id = p.id WHERE pp.pool_id = ? ORDER BY pp.id DESC LIMIT ? OFFSET ?",
+        (pool_id, size, offset),
+    )
+    items = [row_to_product(r) for r in cur.fetchall()]
+    conn.close()
+    return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
+
+@router.post("/pools/public/products")
+def add_product_to_public_pool(body: PoolAddProduct):
+    if not get_product(body.product_id):
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM pools WHERE is_public = 1 LIMIT 1")
+    pool = cur.fetchone()
+    if not pool:
+        cur.execute("INSERT INTO pools(name, is_public) VALUES(?, ?)", ("public", 1))
+        conn.commit()
+        pool_id = cur.lastrowid
+    else:
+        pool_id = pool[0]
+    try:
+        cur.execute("INSERT INTO pool_products(pool_id, product_id) VALUES(?, ?)", (pool_id, body.product_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return error_response(400, "VALIDATION_ERROR", "已在公共池")
+    conn.close()
+    return ok({"pool": "public", "product_id": body.product_id})
+
+@router.post("/users/{user_id}/select_from_pool")
+def user_select_from_pool(user_id: int, body: SelectFromPoolBody):
+    if not get_product(body.product_id):
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    now = now_iso()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO user_follows(user_id, product_id, created_at) VALUES(?, ?, ?)", (user_id, body.product_id, now))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return error_response(400, "VALIDATION_ERROR", "已选择/关注")
+    conn.close()
+    return ok({"user_id": user_id, "product_id": body.product_id})
+
+@router.post("/collections")
+def create_collection(body: CollectionCreate):
+    now = now_iso()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE id = ?", (body.owner_user_id,))
+    owner = cur.fetchone()
+    if not owner:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "用户不存在")
+    cur.execute("INSERT INTO collections(name, owner_user_id, created_at) VALUES(?, ?, ?)", (body.name, body.owner_user_id, now))
+    conn.commit()
+    cid = cur.lastrowid
+    # owner becomes admin
+    cur.execute("INSERT INTO collection_members(collection_id, user_id, role) VALUES(?, ?, ?)", (cid, body.owner_user_id, "admin"))
+    conn.commit()
+    conn.close()
+    return ok({"id": cid, "name": body.name, "owner_user_id": body.owner_user_id, "created_at": now})
+
+@router.get("/users/{user_id}/collections")
+def list_user_collections(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT c.id, c.name, c.created_at FROM collection_members m JOIN collections c ON m.collection_id = c.id WHERE m.user_id = ? ORDER BY c.id DESC", (user_id,))
+    items = [{"id": r[0], "name": r[1], "created_at": r[2]} for r in cur.fetchall()]
+    conn.close()
+    return ok(items)
+
+@router.get("/collections/{collection_id}")
+def collection_detail(collection_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, owner_user_id, created_at FROM collections WHERE id = ?", (collection_id,))
+    c = cur.fetchone()
+    if not c:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    cur.execute("SELECT p.id, p.name, p.url, p.category, p.last_updated FROM collection_products cp JOIN products p ON cp.product_id = p.id WHERE cp.collection_id = ? ORDER BY cp.id DESC", (collection_id,))
+    products = [row_to_product(r) for r in cur.fetchall()]
+    cur.execute("SELECT u.id, u.username, u.display_name, m.role FROM collection_members m JOIN users u ON m.user_id = u.id WHERE m.collection_id = ?", (collection_id,))
+    members = [{"id": r[0], "username": r[1], "display_name": r[2], "role": r[3]} for r in cur.fetchall()]
+    conn.close()
+    return ok({"id": c[0], "name": c[1], "owner_user_id": c[2], "created_at": c[3], "products": products, "members": members})
+
+@router.post("/collections/{collection_id}/products")
+def add_collection_product(collection_id: int, body: CollectionAddProduct):
+    if not get_product(body.product_id):
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM collections WHERE id = ?", (collection_id,))
+    c = cur.fetchone()
+    if not c:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    try:
+        cur.execute("INSERT INTO collection_products(collection_id, product_id) VALUES(?, ?)", (collection_id, body.product_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return error_response(400, "VALIDATION_ERROR", "已在集合")
+    conn.close()
+    return ok({"collection_id": collection_id, "product_id": body.product_id})
+
+@router.delete("/collections/{collection_id}/products/{product_id}")
+def remove_collection_product(collection_id: int, product_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM collection_products WHERE collection_id = ? AND product_id = ?", (collection_id, product_id))
+    conn.commit()
+    conn.close()
+    return ok({"collection_id": collection_id, "product_id": product_id})
+
+@router.post("/collections/{collection_id}/share")
+def share_collection(collection_id: int, body: CollectionShare):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM collections WHERE id = ?", (collection_id,))
+    c = cur.fetchone()
+    if not c:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    cur.execute("SELECT id FROM users WHERE id = ?", (body.user_id,))
+    u = cur.fetchone()
+    if not u:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "用户不存在")
+    role = body.role if body.role in {"admin", "editor", "viewer"} else "editor"
+    try:
+        cur.execute("INSERT INTO collection_members(collection_id, user_id, role) VALUES(?, ?, ?)", (collection_id, body.user_id, role))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return error_response(400, "VALIDATION_ERROR", "成员已存在")
+    conn.close()
+    return ok({"collection_id": collection_id, "user_id": body.user_id, "role": role})
+
+@router.get("/collections/{collection_id}/export.xlsx")
+def export_collection_xlsx(collection_id: int, api_key: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM collections WHERE id = ?", (collection_id,))
+    c = cur.fetchone()
+    if not c:
+        conn.close()
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    user = get_user_by_api_key(api_key)
+    if user:
+        reset_user_quota_if_needed(user["id"])
+        quota = user["quota_exports_per_day"] or 0
+        used = user["exports_used_today"] or 0
+        if quota and used >= quota:
+            conn.close()
+            return error_response(429, "QUOTA_EXCEEDED", "导出额度已用尽")
+    cur.execute("SELECT p.id, p.name, p.url, p.category FROM collection_products cp JOIN products p ON cp.product_id = p.id WHERE cp.collection_id = ?", (collection_id,))
+    products = cur.fetchall()
+    try:
+        from openpyxl import Workbook
+    except Exception:
+        conn.close()
+        return error_response(501, "DEPENDENCY_MISSING", "缺少openpyxl依赖，无法导出Excel")
+    wb = Workbook()
+    if wb.active:
+        wb.remove(wb.active)
+    for p in products:
+        ws = wb.create_sheet(title=str(p[1])[:31] or f"P{p[0]}")
+        ws.append(["product_id", "product_name", "url", "category", "price_id", "price", "created_at"])
+        where = ["product_id = ?"]
+        params: List[Any] = [p[0]]
+        if start_date:
+            where.append("substr(created_at,1,10) >= ?")
+            params.append(start_date)
+        if end_date:
+            where.append("substr(created_at,1,10) <= ?")
+            params.append(end_date)
+        cur.execute(f"SELECT id, price, created_at FROM prices WHERE {' AND '.join(where)} ORDER BY created_at DESC", params)
+        for r in cur.fetchall():
+            ws.append([p[0], p[1], p[2], p[3], r[0], r[1], r[2]])
+    import io
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    filename = f"collection_{collection_id}.xlsx"
+    if user:
+        cur.execute("UPDATE users SET exports_used_today = COALESCE(exports_used_today, 0) + 1 WHERE id = ?", (user["id"],))
+        conn.commit()
+    conn.close()
+    return Response(content=bio.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
 @router.get("/users/{user_id}/follows")
 def list_user_follows(user_id: int):
     conn = get_conn()
@@ -435,7 +687,7 @@ def create_task(body: TaskCreate):
     now = now_iso()
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO tasks(product_id, status, created_at, updated_at) VALUES(?, ?, ?, ?)", (body.product_id, "pending", now, now))
+    cur.execute("INSERT INTO tasks(product_id, status, created_at, updated_at, scheduled_at) VALUES(?, ?, ?, ?, ?)", (body.product_id, "pending", now, now, now))
     conn.commit()
     tid = cur.lastrowid
     conn.close()
@@ -459,8 +711,10 @@ def execute_task(task_id: int):
         conn.close()
         return error_response(404, "NOT_FOUND", "资源不存在")
     now = now_iso()
-    cur.execute("UPDATE tasks SET status = 'completed', updated_at = ? WHERE id = ?", (now, task_id))
+    cur.execute("UPDATE tasks SET status = 'running', updated_at = ?, started_at = ? WHERE id = ?", (now, now, task_id))
+    # 写入价格并完成任务
     cur.execute("INSERT INTO prices(product_id, price, created_at) VALUES(?, ?, ?)", (pid, 99.0, now))
+    cur.execute("UPDATE tasks SET status = 'completed', updated_at = ?, completed_at = ? WHERE id = ?", (now, now, task_id))
     conn.commit()
     cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
     t2 = cur.fetchone()
@@ -486,7 +740,7 @@ def listing(body: ListingRequest):
     return ok({"count": len(items), "items": items})
 
 @router.get("/export")
-def export_products(product_ids: str, api_key: Optional[str] = None):
+def export_products(product_ids: str, api_key: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None):
     ids = [int(x) for x in product_ids.split(",") if x.strip().isdigit()]
     if not ids:
         return error_response(400, "VALIDATION_ERROR", "缺少有效的product_ids")
@@ -508,7 +762,15 @@ def export_products(product_ids: str, api_key: Optional[str] = None):
         p = get_product(pid)
         if not p:
             continue
-        cur.execute("SELECT id, price, created_at FROM prices WHERE product_id = ? ORDER BY created_at DESC", (pid,))
+        where = ["product_id = ?"]
+        params: List[Any] = [pid]
+        if start_date:
+            where.append("substr(created_at,1,10) >= ?")
+            params.append(start_date)
+        if end_date:
+            where.append("substr(created_at,1,10) <= ?")
+            params.append(end_date)
+        cur.execute(f"SELECT id, price, created_at FROM prices WHERE {' AND '.join(where)} ORDER BY created_at DESC", params)
         for r in cur.fetchall():
             writer.writerow([pid, p["name"], p["url"], p["category"], r["id"], r["price"], r["created_at"]])
     conn.close()
