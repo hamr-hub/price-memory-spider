@@ -203,6 +203,12 @@ RATE_LIMIT: Dict[str, float] = {}
 def on_startup():
     init_db()
     sys.path.append(os.path.join(BASE_DIR, "src"))
+    try:
+        from runtime.node_runtime import NodeRuntime
+        rt = NodeRuntime()
+        rt.start()
+    except Exception:
+        pass
 
 @router.get("/system/status")
 def system_status():
