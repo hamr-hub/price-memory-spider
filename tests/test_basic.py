@@ -14,6 +14,7 @@ def test_init_db_and_create_product():
 
 
 def test_system_status_envelope():
+    init_db()
     res = system_status()
     assert isinstance(res, dict)
     assert res["success"] is True

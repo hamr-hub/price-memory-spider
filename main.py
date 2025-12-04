@@ -60,6 +60,8 @@ def init_db():
 def ensure_user_commercial_columns(conn: sqlite3.Connection):
     cur = conn.cursor()
     cols = {row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()}
+    if "email" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
     if "api_key" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN api_key TEXT")
     if "plan" not in cols:
@@ -88,6 +90,14 @@ def ensure_task_columns(conn: sqlite3.Connection):
 def ensure_alerts_table(conn: sqlite3.Connection):
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, rule_type TEXT NOT NULL, threshold REAL, percent REAL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(alerts)").fetchall()}
+    if "channel" not in cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN channel TEXT")
+    if "cooldown_minutes" not in cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN cooldown_minutes INTEGER")
+    if "last_triggered_at" not in cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN last_triggered_at TEXT")
+    cur.execute("CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL, product_id INTEGER NOT NULL, user_id INTEGER NOT NULL, price REAL NOT NULL, created_at TEXT NOT NULL, message TEXT, channel TEXT, push_id INTEGER)")
     conn.commit()
 
 def get_user_by_api_key(api_key: Optional[str]) -> Optional[sqlite3.Row]:
@@ -156,6 +166,7 @@ class TaskCreate(BaseModel):
 class UserCreate(BaseModel):
     username: str
     display_name: Optional[str] = None
+    email: Optional[str] = None
 
 class FollowCreate(BaseModel):
     product_id: int
@@ -191,6 +202,8 @@ class AlertCreate(BaseModel):
     rule_type: str
     threshold: Optional[float] = None
     percent: Optional[float] = None
+    channel: Optional[str] = None
+    cooldown_minutes: Optional[int] = None
 
 class AlertStatusUpdate(BaseModel):
     status: str
@@ -300,7 +313,7 @@ def product_trend(product_id: int, start_date: Optional[str] = None, end_date: O
     p = get_product(product_id)
     if not p:
         return error_response(404, "NOT_FOUND", "资源不存在")
-    if granularity not in {"daily"}:
+    if granularity not in {"daily", "hourly"}:
         return error_response(400, "VALIDATION_ERROR", "不支持的粒度")
     conn = get_conn()
     cur = conn.cursor()
@@ -312,28 +325,50 @@ def product_trend(product_id: int, start_date: Optional[str] = None, end_date: O
     if end_date:
         where.append("substr(created_at,1,10) <= ?")
         params.append(end_date)
-    # 按天聚合，计算OHLC与平均值
-    cur.execute(
-        """
-        WITH days AS (
-            SELECT DISTINCT substr(created_at,1,10) AS day
-            FROM prices
-            WHERE product_id = ?
+    if granularity == "daily":
+        cur.execute(
+            """
+            WITH days AS (
+                SELECT DISTINCT substr(created_at,1,10) AS bucket
+                FROM prices
+                WHERE product_id = ?
+            )
+            SELECT d.bucket AS date,
+                   (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,10) = d.bucket ORDER BY created_at ASC LIMIT 1) AS open,
+                   (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,10) = d.bucket ORDER BY created_at DESC LIMIT 1) AS close,
+                   MIN(p.price) AS low,
+                   MAX(p.price) AS high,
+                   AVG(p.price) AS avg,
+                   COUNT(1) AS count
+            FROM days d
+            JOIN prices p ON p.product_id = ? AND substr(p.created_at,1,10) = d.bucket
+            GROUP BY d.bucket
+            ORDER BY d.bucket ASC
+            """,
+            [product_id, product_id, product_id, product_id],
         )
-        SELECT d.day AS date,
-               (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,10) = d.day ORDER BY created_at ASC LIMIT 1) AS open,
-               (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,10) = d.day ORDER BY created_at DESC LIMIT 1) AS close,
-               MIN(p.price) AS low,
-               MAX(p.price) AS high,
-               AVG(p.price) AS avg,
-               COUNT(1) AS count
-        FROM days d
-        JOIN prices p ON p.product_id = ? AND substr(p.created_at,1,10) = d.day
-        GROUP BY d.day
-        ORDER BY d.day ASC
-        """,
-        [product_id, product_id, product_id, product_id],
-    )
+    else:
+        cur.execute(
+            """
+            WITH hours AS (
+                SELECT DISTINCT substr(created_at,1,13) AS bucket
+                FROM prices
+                WHERE product_id = ?
+            )
+            SELECT h.bucket AS date,
+                   (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,13) = h.bucket ORDER BY created_at ASC LIMIT 1) AS open,
+                   (SELECT price FROM prices WHERE product_id = ? AND substr(created_at,1,13) = h.bucket ORDER BY created_at DESC LIMIT 1) AS close,
+                   MIN(p.price) AS low,
+                   MAX(p.price) AS high,
+                   AVG(p.price) AS avg,
+                   COUNT(1) AS count
+            FROM hours h
+            JOIN prices p ON p.product_id = ? AND substr(p.created_at,1,13) = h.bucket
+            GROUP BY h.bucket
+            ORDER BY h.bucket ASC
+            """,
+            [product_id, product_id, product_id, product_id],
+        )
     series = []
     for r in cur.fetchall():
         series.append({
@@ -400,16 +435,16 @@ def create_user(body: UserCreate):
         plan = "basic"
         quota_exports = 5
         today = datetime.datetime.utcnow().date().isoformat()
-        cur.execute("INSERT INTO users(username, display_name, created_at, api_key, plan, quota_exports_per_day, exports_used_today, last_quota_reset) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (body.username, body.display_name, now, api_key, plan, quota_exports, 0, today))
+        cur.execute("INSERT INTO users(username, display_name, created_at, email, api_key, plan, quota_exports_per_day, exports_used_today, last_quota_reset) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", (body.username, body.display_name, now, body.email, api_key, plan, quota_exports, 0, today))
         conn.commit()
         uid = cur.lastrowid
     except sqlite3.IntegrityError:
         conn.close()
         return error_response(400, "VALIDATION_ERROR", "用户名已存在")
-    cur.execute("SELECT id, username, display_name, created_at, api_key, plan, quota_exports_per_day FROM users WHERE id = ?", (uid,))
+    cur.execute("SELECT id, username, display_name, created_at, email, api_key, plan, quota_exports_per_day FROM users WHERE id = ?", (uid,))
     r = cur.fetchone()
     conn.close()
-    return ok({"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3], "api_key": r[4], "plan": r[5], "quota_exports_per_day": r[6]})
+    return ok({"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3], "email": r[4], "api_key": r[5], "plan": r[6], "quota_exports_per_day": r[7]})
 
 @router.get("/users")
 def list_users(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None):
@@ -418,13 +453,13 @@ def list_users(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), 
     where = []
     params: List[Any] = []
     if search:
-        where.append("username LIKE ?")
-        params.append(f"%{search}%")
+        where.append("(username LIKE ? OR display_name LIKE ? OR COALESCE(email, '') LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     total = conn.execute(f"SELECT COUNT(*) FROM users {where_sql}", params).fetchone()[0]
     offset = (page - 1) * size
-    cur.execute(f"SELECT id, username, display_name, created_at FROM users {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?", params + [size, offset])
-    items = [{"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3]} for r in cur.fetchall()]
+    cur.execute(f"SELECT id, username, display_name, created_at, email FROM users {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?", params + [size, offset])
+    items = [{"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3], "email": r[4]} for r in cur.fetchall()]
     conn.close()
     return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
 
@@ -455,7 +490,7 @@ def product_followers(product_id: int):
     return ok(items)
 
 @router.get("/pools/public/products")
-def list_public_pool_products(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100)):
+def list_public_pool_products(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None, category: Optional[str] = None):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT id FROM pools WHERE is_public = 1 LIMIT 1")
@@ -464,11 +499,20 @@ def list_public_pool_products(page: int = Query(1, ge=1), size: int = Query(20, 
         conn.close()
         return ok({"items": [], "page": page, "size": size, "total": 0, "pages": 0})
     pool_id = pool[0]
-    total = cur.execute("SELECT COUNT(*) FROM pool_products WHERE pool_id = ?", (pool_id,)).fetchone()[0]
+    where = ["pp.pool_id = ?"]
+    params: List[Any] = [pool_id]
+    if search:
+        where.append("p.name LIKE ?")
+        params.append(f"%{search}%")
+    if category:
+        where.append("p.category = ?")
+        params.append(category)
+    where_sql = f"WHERE {' AND '.join(where)}"
+    total = cur.execute(f"SELECT COUNT(*) FROM pool_products pp JOIN products p ON pp.product_id = p.id {where_sql}", params).fetchone()[0]
     offset = (page - 1) * size
     cur.execute(
-        "SELECT p.id, p.name, p.url, p.category, p.last_updated FROM pool_products pp JOIN products p ON pp.product_id = p.id WHERE pp.pool_id = ? ORDER BY pp.id DESC LIMIT ? OFFSET ?",
-        (pool_id, size, offset),
+        f"SELECT p.id, p.name, p.url, p.category, p.last_updated FROM pool_products pp JOIN products p ON pp.product_id = p.id {where_sql} ORDER BY pp.id DESC LIMIT ? OFFSET ?",
+        params + [size, offset],
     )
     items = [row_to_product(r) for r in cur.fetchall()]
     conn.close()
@@ -689,7 +733,7 @@ def create_alert(body: AlertCreate):
         return error_response(404, "NOT_FOUND", "资源不存在")
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO alerts(user_id, product_id, rule_type, threshold, percent, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (body.user_id, body.product_id, body.rule_type, body.threshold, body.percent, "active", now, now))
+    cur.execute("INSERT INTO alerts(user_id, product_id, rule_type, threshold, percent, status, created_at, updated_at, channel, cooldown_minutes) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (body.user_id, body.product_id, body.rule_type, body.threshold, body.percent, "active", now, now, "inapp", 60))
     conn.commit()
     cur.execute("SELECT * FROM alerts WHERE id = last_insert_rowid()")
     r = cur.fetchone()
@@ -718,6 +762,42 @@ def delete_alert(alert_id: int):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+    conn.commit()
+    conn.close()
+    return ok({"id": alert_id})
+
+@router.get("/alerts/{alert_id}/events")
+def list_alert_events(alert_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM alert_events WHERE alert_id = ? ORDER BY id DESC", (alert_id,))
+    items = [{"id": r["id"], "product_id": r["product_id"], "user_id": r["user_id"], "price": r["price"], "created_at": r["created_at"], "message": r["message"], "channel": r["channel"], "push_id": r["push_id"]} for r in cur.fetchall()]
+    conn.close()
+    return ok(items)
+
+@router.post("/alerts/{alert_id}/update")
+def update_alert(alert_id: int, threshold: Optional[float] = None, channel: Optional[str] = None, cooldown_minutes: Optional[int] = None):
+    now = now_iso()
+    conn = get_conn()
+    cur = conn.cursor()
+    fields = []
+    params: List[Any] = []
+    if threshold is not None:
+        fields.append("threshold = ?")
+        params.append(threshold)
+    if channel is not None:
+        fields.append("channel = ?")
+        params.append(channel)
+    if cooldown_minutes is not None:
+        fields.append("cooldown_minutes = ?")
+        params.append(cooldown_minutes)
+    if not fields:
+        conn.close()
+        return ok({"id": alert_id})
+    fields.append("updated_at = ?")
+    params.append(now)
+    params.append(alert_id)
+    cur.execute(f"UPDATE alerts SET {', '.join(fields)} WHERE id = ?", params)
     conn.commit()
     conn.close()
     return ok({"id": alert_id})
@@ -851,8 +931,9 @@ def execute_task(task_id: int):
     cur.execute("SELECT price, created_at FROM prices WHERE product_id = ? ORDER BY created_at DESC LIMIT 1", (pid,))
     rlast = cur.fetchone()
     last_price = float(rlast[0]) if rlast else None
-    base = last_price if last_price is not None else random.uniform(50.0, 200.0)
-    price = round(base * (1 + random.uniform(-0.03, 0.03)), 2)
+    fetched = try_fetch_price(p["url"]) if p and p.get("url") else None
+    base = fetched if (isinstance(fetched, float) and fetched > 0) else (last_price if last_price is not None else random.uniform(50.0, 200.0))
+    price = round(base * (1 + (0 if fetched else random.uniform(-0.03, 0.03))), 2)
     cur.execute("SELECT price, substr(created_at,1,16) AS m FROM prices WHERE product_id = ? ORDER BY created_at DESC LIMIT 1", (pid,))
     prev = cur.fetchone()
     curr_minute = now[:16]
@@ -867,6 +948,23 @@ def execute_task(task_id: int):
     conn.close()
     return ok({"id": t2["id"], "product_id": t2["product_id"], "status": t2["status"], "created_at": t2["created_at"], "updated_at": t2["updated_at"]})
 
+def try_fetch_price(url: str) -> Optional[float]:
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(url, timeout=5)
+        html = resp.read().decode("utf-8", errors="ignore")
+        import re
+        # simple patterns for currency prices
+        patterns = [r"\$\s*(\d+(?:\.\d+)?)", r"¥\s*(\d+(?:\.\d+)?)", r"CNY\s*(\d+(?:\.\d+)?)"]
+        for pat in patterns:
+            m = re.search(pat, html)
+            if m:
+                val = float(m.group(1))
+                return val
+        return None
+    except Exception:
+        return None
+
 def evaluate_alerts_for_product(cur: sqlite3.Cursor, product_id: int, price: float, now: str):
     cur.execute("SELECT id, user_id, rule_type, threshold, percent FROM alerts WHERE product_id = ? AND status = 'active'", (product_id,))
     for a in cur.fetchall():
@@ -877,7 +975,29 @@ def evaluate_alerts_for_product(cur: sqlite3.Cursor, product_id: int, price: flo
         if rt == "price_lte" and th is not None and price <= float(th):
             trig = True
         if trig:
-            cur.execute("INSERT INTO pushes(sender_id, recipient_id, product_id, message, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)", (0, uid, product_id, f"价格触发: {price}", "pending", now, now))
+            # cooldown check
+            cur.execute("SELECT cooldown_minutes, last_triggered_at, COALESCE(channel, 'inapp') FROM alerts WHERE id = ?", (a[0],))
+            cfg = cur.fetchone()
+            cooldown = int(cfg[0]) if (cfg and cfg[0] is not None) else 60
+            last_ts = cfg[1]
+            channel = cfg[2]
+            allow = True
+            if last_ts:
+                try:
+                    last_dt = datetime.datetime.fromisoformat(last_ts.replace("Z", ""))
+                    now_dt = datetime.datetime.fromisoformat(now.replace("Z", ""))
+                    allow = (now_dt - last_dt).total_seconds() >= cooldown * 60
+                except Exception:
+                    allow = True
+            if not allow:
+                continue
+            push_id = None
+            if channel == "inapp":
+                cur.execute("INSERT INTO pushes(sender_id, recipient_id, product_id, message, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)", (0, uid, product_id, f"价格触发: {price}", "pending", now, now))
+                push_id = cur.lastrowid
+            # record event
+            cur.execute("INSERT INTO alert_events(alert_id, product_id, user_id, price, created_at, message, channel, push_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (a[0], product_id, uid, price, now, "触发", channel, push_id))
+            cur.execute("UPDATE alerts SET last_triggered_at = ?, updated_at = ? WHERE id = ?", (now, now, a[0]))
 
 @router.post("/spider/listing")
 def listing(body: ListingRequest):

@@ -77,3 +77,15 @@ class SupabaseRepo:
         if message:
             payload["result_message"] = message
         self.client.table("tasks").update(payload).eq("id", task_id).execute()
+
+    def rpc_prices_aggregate(self, product_ids: List[int], interval: str, start_ts: Optional[str], end_ts: Optional[str]) -> List[Dict[str, Any]]:
+        res = self.client.rpc("rpc_prices_aggregate", {"product_ids": product_ids, "interval": interval, "start_ts": start_ts, "end_ts": end_ts}).execute()
+        return getattr(res, "data", None) or []
+
+    def storage_upload(self, bucket: str, path: str, data: bytes) -> None:
+        self.client.storage.from_(bucket).upload(path, data)
+
+    def storage_signed_url(self, bucket: str, path: str, expires: int = 3600) -> Optional[str]:
+        res = self.client.storage.from_(bucket).create_signed_url(path, expires)
+        url = getattr(res, "signed_url", None) or getattr(res, "data", None)
+        return url

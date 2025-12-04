@@ -5,6 +5,8 @@ import socket
 import platform
 import json
 import uuid
+import tempfile
+import shutil
 from datetime import datetime, timezone
 from typing import Optional
 from supabase import Client
@@ -131,25 +133,88 @@ class NodeRuntime:
             self._log(job_id, "warn", "节点处于暂停状态，跳过执行")
             return
         ws = os.environ.get("PLAYWRIGHT_WS_ENDPOINT") or "ws://43.133.224.11:20001/"
-        if BowserBrowser is None:
-            self._log(job_id, "error", "Playwright 未可用，无法执行")
+        if not self.client:
+            self._log(job_id, "error", "Supabase 客户端不可用")
             return
+        # 确保存储桶存在
         try:
-            browser = BowserBrowser(ws_endpoint=ws, headless=True)
-            def action(page):
+            bconf = {"public": True}
+            getattr(self.client.storage, "create_bucket", lambda *a, **k: None)("artifacts", **bconf)
+        except Exception:
+            pass
+        tmpdir = tempfile.mkdtemp(prefix=f"pm_{job_id}_")
+        trace_path = os.path.join(tmpdir, "trace.zip")
+        har_path = os.path.join(tmpdir, "har.zip")
+        screenshot_path = os.path.join(tmpdir, "screenshot.png")
+        video_file = None
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.connect(ws)
+                context = browser.new_context(record_video_dir=tmpdir, record_har_path=har_path, record_har_mode="minimal")
+                context.tracing.start(screenshots=True, snapshots=True, sources=True)
+                page = context.new_page()
+                page.set_default_timeout(30000)
+                page.goto(url)
+                title = page.title()
+                self._log(job_id, "info", f"页面标题: {title}")
+                body = page.evaluate("document.body.innerText") or ""
+                self._log(job_id, "debug", f"正文长度: {len(body)}")
                 try:
-                    page.goto(url)
-                    title = page.title()
-                    self._log(job_id, "info", f"页面标题: {title}")
-                    body = page.evaluate("document.body.innerText") or ""
-                    self._log(job_id, "debug", f"正文长度: {len(body)}")
-                except Exception as e:
-                    self._log(job_id, "error", f"页面操作失败: {str(e)}")
-            browser.run_sync(url, action, timeout=30000)
-            # 生成模拟价格结果
+                    page.screenshot(path=screenshot_path, full_page=True)
+                except Exception:
+                    pass
+                context.tracing.stop(path=trace_path)
+                page.close()
+                vids = []
+                try:
+                    vpath = page.video.path()
+                    vids.append(vpath)
+                except Exception:
+                    pass
+                video_file = vids[0] if vids else None
+                browser.close()
+        except Exception as e:
+            self._log(job_id, "error", f"浏览器执行失败: {str(e)}")
+        # 上传工件
+        try:
+            bucket = self.client.storage.from_("artifacts")
+            if os.path.exists(trace_path):
+                with open(trace_path, "rb") as f:
+                    bucket.upload(f"{job_id}/trace.zip", f)
+                pub = bucket.get_public_url(f"{job_id}/trace.zip")
+                urlt = getattr(pub, "data", {}).get("publicUrl") or getattr(pub, "publicURL", None) or pub
+                self._log(job_id, "artifact", json.dumps({"type": "trace", "url": urlt}))
+            if os.path.exists(har_path):
+                with open(har_path, "rb") as f:
+                    bucket.upload(f"{job_id}/har.zip", f)
+                pubh = bucket.get_public_url(f"{job_id}/har.zip")
+                urlh = getattr(pubh, "data", {}).get("publicUrl") or getattr(pubh, "publicURL", None) or pubh
+                self._log(job_id, "artifact", json.dumps({"type": "har", "url": urlh}))
+            if video_file and os.path.exists(video_file):
+                with open(video_file, "rb") as f:
+                    bucket.upload(f"{job_id}/video.webm", f)
+                pubv = bucket.get_public_url(f"{job_id}/video.webm")
+                urlv = getattr(pubv, "data", {}).get("publicUrl") or getattr(pubv, "publicURL", None) or pubv
+                self._log(job_id, "artifact", json.dumps({"type": "video", "url": urlv}))
+            if os.path.exists(screenshot_path):
+                with open(screenshot_path, "rb") as f:
+                    bucket.upload(f"{job_id}/screenshot.png", f)
+                pubs = bucket.get_public_url(f"{job_id}/screenshot.png")
+                urls = getattr(pubs, "data", {}).get("publicUrl") or getattr(pubs, "publicURL", None) or pubs
+                self._log(job_id, "artifact", json.dumps({"type": "screenshot", "url": urls}))
+        except Exception as e:
+            self._log(job_id, "warn", f"工件上传失败: {str(e)}")
+        finally:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+        # 生成模拟价格结果
+        try:
             import random
             price = round(random.uniform(50.0, 200.0), 2)
             self._log(job_id, "result", json.dumps({"price": price, "url": url}))
             self._log(job_id, "info", "测试爬取完成")
-        except Exception as e:
-            self._log(job_id, "error", f"浏览器执行失败: {str(e)}")
+        except Exception:
+            pass
