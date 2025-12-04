@@ -487,38 +487,57 @@ class NodeRuntime:
         txt = r.text
         steps = []
         lines = txt.splitlines()
+        import re
         if target == "python":
-            import re
             pat = {
                 "goto": re.compile(r"page\.goto\((['\"])(.+?)\1\)"),
+                "wait": re.compile(r"page\.wait_for_selector\((['\"])(.+?)\1\)"),
                 "click": re.compile(r"page\.click\((['\"])(.+?)\1\)"),
                 "fill": re.compile(r"page\.fill\((['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\)"),
-                "wait": re.compile(r"page\.wait_for_selector\((['\"])(.+?)\1\)"),
+                "hover": re.compile(r"page\.hover\((['\"])(.+?)\1\)"),
+                "press": re.compile(r"page\.press\((['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\)"),
+                "locatorClick": re.compile(r"page\.locator\((['\"])(.+?)\1\)\.click\(\)"),
+                "getByRoleClick": re.compile(r"page\.get_by_role\((['\"])(.+?)\1,\s*name=(['\"])(.+?)\3[^)]*\)\.click\(\)"),
+                "getByTextClick": re.compile(r"page\.get_by_text\((['\"])(.+?)\1\)\.click\(\)"),
             }
         else:
-            import re
             pat = {
                 "goto": re.compile(r"await\s+page\.goto\((['\"])(.+?)\1\)"),
+                "wait": re.compile(r"await\s+page\.waitForSelector\((['\"])(.+?)\1\)"),
                 "click": re.compile(r"await\s+page\.click\((['\"])(.+?)\1\)"),
                 "fill": re.compile(r"await\s+page\.fill\((['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\)"),
-                "wait": re.compile(r"await\s+page\.waitForSelector\((['\"])(.+?)\1\)"),
+                "hover": re.compile(r"await\s+page\.hover\((['\"])(.+?)\1\)"),
+                "press": re.compile(r"await\s+page\.press\((['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\)"),
+                "locatorClick": re.compile(r"await\s+page\.locator\((['\"])(.+?)\1\)\.click\(\)"),
+                "getByRoleClick": re.compile(r"await\s+page\.getByRole\((['\"])(.+?)\1,\s*\{\s*name:\s*(['\"])(.+?)\3[^}]*\}\)\.click\(\)"),
+                "getByTextClick": re.compile(r"await\s+page\.getByText\((['\"])(.+?)\1\)\.click\(\)"),
             }
         for ln in lines:
             m = pat["goto"].search(ln)
-            if m:
-                steps.append({"action": "goto", "url": m.group(2)})
-                continue
+            if m: steps.append({"action": "goto", "url": m.group(2)}); continue
             m = pat["wait"].search(ln)
-            if m:
-                steps.append({"action": "wait_for_selector", "selector": m.group(2)})
-                continue
+            if m: steps.append({"action": "wait_for_selector", "selector": m.group(2)}); continue
             m = pat["click"].search(ln)
-            if m:
-                steps.append({"action": "click", "selector": m.group(2)})
-                continue
+            if m: steps.append({"action": "click", "selector": m.group(2)}); continue
             m = pat["fill"].search(ln)
+            if m: steps.append({"action": "fill", "selector": m.group(2), "value": m.group(4)}); continue
+            m = pat["hover"].search(ln)
+            if m: steps.append({"action": "wait_for_selector", "selector": m.group(2)}); steps.append({"action": "hover", "selector": m.group(2)}); continue
+            m = pat["press"].search(ln)
+            if m: steps.append({"action": "press", "selector": m.group(2), "value": m.group(4)}); continue
+            m = pat["locatorClick"].search(ln)
+            if m: steps.append({"action": "click", "selector": m.group(2)}); continue
+            m = pat["getByRoleClick"].search(ln)
             if m:
-                steps.append({"action": "fill", "selector": m.group(2), "value": m.group(4)})
+                nm = m.group(4)
+                steps.append({"action": "wait_for_selector", "selector": f"text={nm}"})
+                steps.append({"action": "click", "selector": f"text={nm}"})
+                continue
+            m = pat["getByTextClick"].search(ln)
+            if m:
+                tx = m.group(2)
+                steps.append({"action": "wait_for_selector", "selector": f"text={tx}"})
+                steps.append({"action": "click", "selector": f"text={tx}"})
                 continue
         import io, json as pyjson
         bio = io.BytesIO(pyjson.dumps({"steps": steps}).encode("utf-8"))

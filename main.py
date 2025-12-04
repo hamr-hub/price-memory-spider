@@ -14,6 +14,30 @@ BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "spider.db")
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+src_path = os.path.join(BASE_DIR, "src")
+if src_path not in sys.path:
+    sys.path.append(src_path)
+try:
+    from src.dao.supabase_client import get_client
+    SB = get_client()
+except Exception:
+    SB = None
+
+import sqlite3
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL, category TEXT, last_updated TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS prices (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, price REAL NOT NULL, created_at TEXT NOT NULL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, status TEXT NOT NULL, priority INTEGER DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, display_name TEXT, email TEXT, created_at TEXT, api_key TEXT, plan TEXT, quota_exports_per_day INTEGER, exports_used_today INTEGER, last_quota_reset TEXT, quota_tasks_per_day INTEGER, tasks_created_today INTEGER, last_tasks_quota_reset TEXT)")
+    conn.commit()
+    conn.close()
 try:
     src_path = os.path.join(BASE_DIR, "src")
     if src_path not in sys.path:
@@ -22,6 +46,25 @@ try:
     SB = get_client()
 except Exception:
     SB = None
+
+def get_conn():
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        pass
+    return conn
+
+def init_db():
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT, category TEXT, last_updated TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS prices (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, price REAL, created_at TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, status TEXT, priority INTEGER, created_at TEXT, updated_at TEXT, scheduled_at TEXT, started_at TEXT, completed_at TEXT, created_by_user_id INTEGER)")
+    conn.commit()
+    conn.close()
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -34,11 +77,18 @@ def error_response(status_code: int, code: str, message: str, details: Optional[
 
 
 def get_user_by_api_key(api_key: Optional[str]) -> Optional[dict]:
-    if not api_key:
+    if not api_key or not isinstance(api_key, str):
         return None
-    res = SB.table("users").select("*").eq("api_key", api_key).limit(1).execute()
-    data = getattr(res, "data", None) or []
-    return data[0] if data else None
+    if SB:
+        res = SB.table("users").select("*").eq("api_key", api_key).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        return data[0] if data else None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, api_key, quota_exports_per_day, exports_used_today, last_quota_reset FROM users WHERE api_key = ? LIMIT 1", (api_key,))
+    r = cur.fetchone()
+    conn.close()
+    return {"id": r[0], "api_key": r[1], "quota_exports_per_day": r[2], "exports_used_today": r[3], "last_quota_reset": r[4]} if r else None
 
 def reset_user_quota_if_needed(user_id: int):
     today = datetime.datetime.utcnow().date().isoformat()
@@ -57,18 +107,36 @@ def row_to_price(r: dict) -> dict:
     return {"id": r.get("id"), "product_id": r.get("product_id"), "price": r.get("price"), "created_at": r.get("created_at")}
 
 def create_product(name: str, url: str, category: Optional[str] = None) -> int:
+    if SB:
+        now = now_iso()
+        res = SB.table("products").insert({"name": name, "url": url, "category": category, "updated_at": now}).select("id").execute()
+        data = getattr(res, "data", None) or []
+        return int(data[0]["id"]) if data else 0
+    conn = get_conn()
+    cur = conn.cursor()
     now = now_iso()
-    res = SB.table("products").insert({"name": name, "url": url, "category": category, "updated_at": now}).select("id").execute()
-    data = getattr(res, "data", None) or []
-    return int(data[0]["id"]) if data else 0
+    cur.execute("INSERT INTO products(name, url, category, last_updated) VALUES(?, ?, ?, ?)", (name, url, category, now))
+    conn.commit()
+    pid = cur.lastrowid
+    conn.close()
+    return int(pid)
 
 def get_product(product_id: int) -> Optional[dict]:
-    res = SB.table("products").select("*").eq("id", product_id).limit(1).execute()
-    data = getattr(res, "data", None) or []
-    if not data:
+    if SB:
+        res = SB.table("products").select("*").eq("id", product_id).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        if not data:
+            return None
+        r = data[0]
+        return {"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")}
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    r = cur.fetchone()
+    conn.close()
+    if not r:
         return None
-    r = data[0]
-    return {"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")}
+    return {"id": r["id"], "name": r["name"], "url": r["url"], "category": r["category"], "last_updated": r["last_updated"]}
 
 class ProductCreate(BaseModel):
     name: str
@@ -163,11 +231,21 @@ def on_startup():
 
 @router.get("/system/status")
 def system_status():
-    total = getattr(SB.table("tasks").select("id", count="exact").execute(), "count", 0) or 0
-    completed = getattr(SB.table("tasks").select("id", count="exact").eq("status", "completed").execute(), "count", 0) or 0
-    pending = getattr(SB.table("tasks").select("id", count="exact").eq("status", "pending").execute(), "count", 0) or 0
+    if SB:
+        total = getattr(SB.table("tasks").select("id", count="exact").execute(), "count", 0) or 0
+        completed = getattr(SB.table("tasks").select("id", count="exact").eq("status", "completed").execute(), "count", 0) or 0
+        pending = getattr(SB.table("tasks").select("id", count="exact").eq("status", "pending").execute(), "count", 0) or 0
+        today = datetime.datetime.utcnow().date().isoformat()
+        today_count = getattr(SB.table("tasks").select("id", count="exact").gte("created_at", today).execute(), "count", 0) or 0
+        return ok({"health": "ok", "today_tasks": today_count, "total_tasks": total, "completed_tasks": completed, "pending_tasks": pending})
+    conn = get_conn()
+    cur = conn.cursor()
+    total = cur.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    completed = cur.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'").fetchone()[0]
+    pending = cur.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'").fetchone()[0]
     today = datetime.datetime.utcnow().date().isoformat()
-    today_count = getattr(SB.table("tasks").select("id", count="exact").gte("created_at", today).execute(), "count", 0) or 0
+    today_count = cur.execute("SELECT COUNT(*) FROM tasks WHERE substr(created_at,1,10) = ?", (today,)).fetchone()[0]
+    conn.close()
     return ok({"health": "ok", "today_tasks": today_count, "total_tasks": total, "completed_tasks": completed, "pending_tasks": pending})
 
 @router.get("/products")
@@ -195,9 +273,11 @@ def search_products(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=1
 
 @router.post("/products")
 def create_product_endpoint(body: ProductCreate):
-    pid = create_product(body.name, body.url, body.category)
-    p = get_product(pid)
-    return ok(p)
+    try:
+        pid = create_product(body.name, body.url, body.category)
+        return ok({"id": pid, "name": body.name, "url": body.url, "category": body.category})
+    except Exception as e:
+        return error_response(500, "INTERNAL_ERROR", str(e))
 
 @router.patch("/products/{product_id}")
 def update_product_endpoint(product_id: int, body: ProductCreate):
@@ -451,17 +531,37 @@ def export_products_xlsx(product_ids: str, start_date: Optional[str] = None, end
 
 @router.post("/users")
 def create_user(body: UserCreate):
+    if SB:
+        now = now_iso()
+        api_key = secrets.token_hex(16)
+        plan = "basic"
+        quota_exports = 5
+        today = datetime.datetime.utcnow().date().isoformat()
+        res = SB.table("users").insert({"username": body.username, "display_name": body.display_name, "created_at": now, "email": body.email, "api_key": api_key, "plan": plan, "quota_exports_per_day": quota_exports, "exports_used_today": 0, "last_quota_reset": today}).select("id,username,display_name,created_at,email,api_key,plan,quota_exports_per_day").execute()
+        data = getattr(res, "data", None) or []
+        if not data:
+            return error_response(400, "VALIDATION_ERROR", "用户名已存在")
+        r = data[0]
+        return ok({"id": r.get("id"), "username": r.get("username"), "display_name": r.get("display_name"), "created_at": r.get("created_at"), "email": r.get("email"), "api_key": r.get("api_key"), "plan": r.get("plan"), "quota_exports_per_day": r.get("quota_exports_per_day")})
+    import sqlite3
     now = now_iso()
-    api_key = secrets.token_hex(16)
-    plan = "basic"
-    quota_exports = 5
-    today = datetime.datetime.utcnow().date().isoformat()
-    res = SB.table("users").insert({"username": body.username, "display_name": body.display_name, "created_at": now, "email": body.email, "api_key": api_key, "plan": plan, "quota_exports_per_day": quota_exports, "exports_used_today": 0, "last_quota_reset": today}).select("id,username,display_name,created_at,email,api_key,plan,quota_exports_per_day").execute()
-    data = getattr(res, "data", None) or []
-    if not data:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        api_key = secrets.token_hex(16)
+        plan = "basic"
+        quota_exports = 5
+        today = datetime.datetime.utcnow().date().isoformat()
+        cur.execute("INSERT INTO users(username, display_name, created_at, api_key, plan, quota_exports_per_day, exports_used_today, last_quota_reset) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (body.username, body.display_name, now, api_key, plan, quota_exports, 0, today))
+        conn.commit()
+        uid = cur.lastrowid
+    except sqlite3.IntegrityError:
+        conn.close()
         return error_response(400, "VALIDATION_ERROR", "用户名已存在")
-    r = data[0]
-    return ok({"id": r.get("id"), "username": r.get("username"), "display_name": r.get("display_name"), "created_at": r.get("created_at"), "email": r.get("email"), "api_key": r.get("api_key"), "plan": r.get("plan"), "quota_exports_per_day": r.get("quota_exports_per_day")})
+    cur.execute("SELECT id, username, display_name, created_at, api_key, plan, quota_exports_per_day FROM users WHERE id = ?", (uid,))
+    r = cur.fetchone()
+    conn.close()
+    return ok({"id": r[0], "username": r[1], "display_name": r[2], "created_at": r[3], "api_key": r[4], "plan": r[5], "quota_exports_per_day": r[6]})
 
 @router.get("/users")
 def list_users(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None):
@@ -500,42 +600,94 @@ def product_followers(product_id: int):
 
 @router.get("/pools/public/products")
 def list_public_pool_products(page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None, category: Optional[str] = None):
+    if SB:
+        pres = SB.table("pools").select("id").eq("is_public", True).limit(1).execute()
+        pitems = getattr(pres, "data", None) or []
+        if not pitems:
+            return ok({"items": [], "page": page, "size": size, "total": 0, "pages": 0})
+        pool_id = pitems[0]["id"]
+        offset = (page - 1) * size
+        links_q = SB.table("pool_products").select("product_id", count="exact").eq("pool_id", pool_id).order("id", desc=True)
+        links = links_q.range(offset, offset + size - 1).execute()
+        ids = [x.get("product_id") for x in (getattr(links, "data", None) or [])]
+        total = getattr(links, "count", 0) or 0
+        if not ids:
+            return ok({"items": [], "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
+        pq = SB.table("products").select("*").in_("id", ids)
+        if search:
+            pq = pq.ilike("name", f"%{search}%")
+        if category:
+            pq = pq.eq("category", category)
+        products = getattr(pq.execute(), "data", None) or []
+        items = [{"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")} for r in products]
+        return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM pools WHERE is_public = 1 LIMIT 1")
+    pool = cur.fetchone()
+    if not pool:
+        conn.close()
+        return ok({"items": [], "page": page, "size": size, "total": 0, "pages": 0})
+    pool_id = pool[0]
+    total = cur.execute("SELECT COUNT(*) FROM pool_products WHERE pool_id = ?", (pool_id,)).fetchone()[0]
+    offset = (page - 1) * size
+    cur.execute(
+        "SELECT p.id, p.name, p.url, p.category, p.last_updated FROM pool_products pp JOIN products p ON pp.product_id = p.id WHERE pp.pool_id = ? ORDER BY pp.id DESC LIMIT ? OFFSET ?",
+        (pool_id, size, offset),
+    )
+    items = [{"id": r[0], "name": r[1], "url": r[2], "category": r[3], "last_updated": r[4]} for r in cur.fetchall()]
+    conn.close()
+    return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
+
+@router.get("/pools/public/categories")
+def list_public_pool_categories():
     pres = SB.table("pools").select("id").eq("is_public", True).limit(1).execute()
     pitems = getattr(pres, "data", None) or []
     if not pitems:
-        return ok({"items": [], "page": page, "size": size, "total": 0, "pages": 0})
+        return ok([])
     pool_id = pitems[0]["id"]
-    offset = (page - 1) * size
-    links_q = SB.table("pool_products").select("product_id", count="exact").eq("pool_id", pool_id).order("id", desc=True)
-    links = links_q.range(offset, offset + size - 1).execute()
+    links = SB.table("pool_products").select("product_id").eq("pool_id", pool_id).order("id", desc=True).execute()
     ids = [x.get("product_id") for x in (getattr(links, "data", None) or [])]
-    total = getattr(links, "count", 0) or 0
     if not ids:
-        return ok({"items": [], "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
-    pq = SB.table("products").select("*").in_("id", ids)
-    if search:
-        pq = pq.ilike("name", f"%{search}%")
-    if category:
-        pq = pq.eq("category", category)
-    products = getattr(pq.execute(), "data", None) or []
-    items = [{"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")} for r in products]
-    return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
+        return ok([])
+    products = getattr(SB.table("products").select("category").in_("id", ids).execute(), "data", None) or []
+    cats = sorted(list({(r.get("category") or "").strip() for r in products if r.get("category")}))
+    return ok(cats)
 
 @router.post("/pools/public/products")
 def add_product_to_public_pool(body: PoolAddProduct):
     if not get_product(body.product_id):
         return error_response(404, "NOT_FOUND", "资源不存在")
-    pres = SB.table("pools").select("id").eq("is_public", True).limit(1).execute()
-    pitems = getattr(pres, "data", None) or []
-    if not pitems:
-        cres = SB.table("pools").insert({"name": "public", "is_public": True}).select("id").execute()
-        pool_id = (getattr(cres, "data", None) or [{}])[0].get("id")
+    if SB:
+        pres = SB.table("pools").select("id").eq("is_public", True).limit(1).execute()
+        pitems = getattr(pres, "data", None) or []
+        if not pitems:
+            cres = SB.table("pools").insert({"name": "public", "is_public": True}).select("id").execute()
+            pool_id = (getattr(cres, "data", None) or [{}])[0].get("id")
+        else:
+            pool_id = pitems[0]["id"]
+        try:
+            SB.table("pool_products").insert({"pool_id": pool_id, "product_id": body.product_id}).execute()
+        except Exception:
+            return error_response(400, "VALIDATION_ERROR", "已在公共池")
+        return ok({"pool": "public", "product_id": body.product_id})
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM pools WHERE is_public = 1 LIMIT 1")
+    pool = cur.fetchone()
+    if not pool:
+        cur.execute("INSERT INTO pools(name, is_public) VALUES(?, ?)", ("public", 1))
+        conn.commit()
+        pool_id = cur.lastrowid
     else:
-        pool_id = pitems[0]["id"]
+        pool_id = pool[0]
     try:
-        SB.table("pool_products").insert({"pool_id": pool_id, "product_id": body.product_id}).execute()
+        cur.execute("INSERT INTO pool_products(pool_id, product_id) VALUES(?, ?)", (pool_id, body.product_id))
+        conn.commit()
     except Exception:
+        conn.close()
         return error_response(400, "VALIDATION_ERROR", "已在公共池")
+    conn.close()
     return ok({"pool": "public", "product_id": body.product_id})
 
 @router.post("/users/{user_id}/select_from_pool")
@@ -543,10 +695,21 @@ def user_select_from_pool(user_id: int, body: SelectFromPoolBody):
     if not get_product(body.product_id):
         return error_response(404, "NOT_FOUND", "资源不存在")
     now = now_iso()
+    if SB:
+        try:
+            SB.table("user_follows").insert({"user_id": user_id, "product_id": body.product_id, "created_at": now}).execute()
+        except Exception:
+            return error_response(400, "VALIDATION_ERROR", "已选择/关注")
+        return ok({"user_id": user_id, "product_id": body.product_id})
+    conn = get_conn()
+    cur = conn.cursor()
     try:
-        SB.table("user_follows").insert({"user_id": user_id, "product_id": body.product_id, "created_at": now}).execute()
+        cur.execute("INSERT INTO user_follows(user_id, product_id, created_at) VALUES(?, ?, ?)", (user_id, body.product_id, now))
+        conn.commit()
     except Exception:
+        conn.close()
         return error_response(400, "VALIDATION_ERROR", "已选择/关注")
+    conn.close()
     return ok({"user_id": user_id, "product_id": body.product_id})
 
 @router.post("/collections")
@@ -562,7 +725,7 @@ def create_collection(body: CollectionCreate):
     return ok({"id": cid, "name": body.name, "owner_user_id": body.owner_user_id, "created_at": now})
 
 @router.get("/users/{user_id}/collections")
-def list_user_collections(user_id: int, page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None):
+def list_user_collections(user_id: int, page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, min_members: Optional[int] = None, max_members: Optional[int] = None):
     links = SB.table("collection_members").select("collection_id").eq("user_id", user_id).execute()
     ids = [x.get("collection_id") for x in (getattr(links, "data", None) or [])]
     if not ids:
@@ -574,6 +737,24 @@ def list_user_collections(user_id: int, page: int = Query(1, ge=1), size: int = 
     res = q.range(offset, offset + size - 1).execute()
     items = getattr(res, "data", None) or []
     total = getattr(res, "count", 0) or len(items)
+    if start_date or end_date or (min_members is not None) or (max_members is not None):
+        if start_date:
+            items = [r for r in items if str(r.get("created_at"))[:10] >= start_date]
+        if end_date:
+            items = [r for r in items if str(r.get("created_at"))[:10] <= end_date]
+        cids = [r.get("id") for r in items]
+        if cids:
+            mres = SB.table("collection_members").select("collection_id", count="exact").in_("collection_id", cids).execute()
+            mitems = getattr(mres, "data", None) or []
+            counts: Dict[int, int] = {}
+            for r in mitems:
+                cid = int(r.get("collection_id"))
+                counts[cid] = counts.get(cid, 0) + 1
+            if min_members is not None:
+                items = [r for r in items if counts.get(int(r.get("id")), 0) >= int(min_members)]
+            if max_members is not None:
+                items = [r for r in items if counts.get(int(r.get("id")), 0) <= int(max_members)]
+        total = len(items)
     return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
 
 @router.get("/collections/{collection_id}")
@@ -818,13 +999,66 @@ def list_tasks(status: Optional[str] = None, product_id: Optional[int] = None):
     items = getattr(res, "data", None) or []
     return ok(items)
 
+@router.get("/spider/tasks/next")
+def next_task():
+    q = SB.table("tasks").select("*").eq("status", "pending").order("priority", desc=True).order("scheduled_at", desc=False).order("id", desc=False).limit(1)
+    res = q.execute()
+    items = getattr(res, "data", None) or []
+    return ok(items[0] if items else None)
+
+@router.post("/spider/tasks/next/execute")
+def execute_next_task():
+    now = now_iso()
+    q = SB.table("tasks").select("*").eq("status", "pending").order("priority", desc=True).order("scheduled_at", desc=False).order("id", desc=False).limit(1)
+    res = q.execute()
+    items = getattr(res, "data", None) or []
+    if not items:
+        return error_response(404, "NOT_FOUND", "无待执行任务")
+    t = items[0]
+    tid = int(t.get("id"))
+    pid = t.get("product_id")
+    if pid is None:
+        return error_response(400, "VALIDATION_ERROR", "任务缺少产品ID")
+    p = get_product(int(pid))
+    if not p:
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    SB.table("tasks").update({"status": "running", "updated_at": now, "started_at": now}).eq("id", tid).execute()
+    rlast = SB.table("prices").select("price,created_at").eq("product_id", pid).order("created_at", desc=True).limit(1).execute()
+    last_rows = getattr(rlast, "data", None) or []
+    last_price = float(last_rows[0]["price"]) if last_rows else None
+    fetched = try_fetch_price(p["url"]) if p and p.get("url") else None
+    base = fetched if (isinstance(fetched, float) and fetched > 0) else (last_price if last_price is not None else random.uniform(50.0, 200.0))
+    price = round(base * (1 + (0 if fetched else random.uniform(-0.03, 0.03))), 2)
+    prev = SB.table("prices").select("price,created_at").eq("product_id", pid).order("created_at", desc=True).limit(1).execute()
+    prev_rows = getattr(prev, "data", None) or []
+    prev_price = float(prev_rows[0]["price"]) if prev_rows else None
+    prev_minute = str(prev_rows[0]["created_at"])[:16] if prev_rows else None
+    curr_minute = now[:16]
+    if not prev_rows or not (prev_price == price and prev_minute == curr_minute):
+        SB.table("prices").insert({"product_id": pid, "price": price, "created_at": now}).execute()
+        evaluate_alerts_for_product(int(pid), price, now)
+    SB.table("products").update({"updated_at": now}).eq("id", int(pid)).execute()
+    SB.table("tasks").update({"status": "completed", "updated_at": now, "completed_at": now}).eq("id", tid).execute()
+    t2 = SB.table("tasks").select("*").eq("id", tid).limit(1).execute()
+    rows = getattr(t2, "data", None) or []
+    r = rows[0] if rows else {}
+    return ok({"id": r.get("id"), "product_id": r.get("product_id"), "status": r.get("status"), "created_at": r.get("created_at"), "updated_at": r.get("updated_at")})
+
 @router.post("/spider/tasks")
 def create_task(body: TaskCreate, api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    now = now_iso()
+    if not SB:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO tasks(product_id, status, priority, created_at, updated_at) VALUES(?, 'pending', ?, ?, ?)", (body.product_id, int(body.priority or 0), now, now))
+        conn.commit()
+        tid = cur.lastrowid
+        conn.close()
+        return ok({"id": tid, "product_id": body.product_id, "status": "pending", "created_at": now, "updated_at": now})
     if _is_node_paused():
         return error_response(409, "NODE_PAUSED", "节点暂停，拒绝创建任务")
-    now = now_iso()
     created_by = None
-    if api_key:
+    if api_key and isinstance(api_key, str):
         u = get_user_by_api_key(api_key)
         if u:
             today = datetime.datetime.utcnow().date().isoformat()
@@ -851,6 +1085,30 @@ def create_task(body: TaskCreate, api_key: Optional[str] = Header(None, alias="X
 
 @router.post("/spider/tasks/{task_id}/execute")
 def execute_task(task_id: int):
+    now = now_iso()
+    if not SB:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        t = cur.fetchone()
+        if not t:
+            conn.close()
+            return error_response(404, "NOT_FOUND", "资源不存在")
+        pid = t["product_id"]
+        if pid is None:
+            conn.close()
+            return error_response(400, "VALIDATION_ERROR", "任务缺少产品ID")
+        p = get_product(int(pid))
+        if not p:
+            conn.close()
+            return error_response(404, "NOT_FOUND", "资源不存在")
+        cur.execute("UPDATE tasks SET status='completed', updated_at=?, completed_at=? WHERE id = ?", (now, now, task_id))
+        cur.execute("INSERT INTO prices(product_id, price, created_at) VALUES(?, ?, ?)", (pid, 99.0, now))
+        conn.commit()
+        cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        r = cur.fetchone()
+        conn.close()
+        return ok({"id": r["id"], "product_id": r["product_id"], "status": r["status"], "created_at": r["created_at"], "updated_at": r["updated_at"]})
     if _is_node_paused():
         return error_response(409, "NODE_PAUSED", "节点暂停，拒绝执行")
     tres = SB.table("tasks").select("*").eq("id", task_id).limit(1).execute()
@@ -861,10 +1119,9 @@ def execute_task(task_id: int):
     pid = t.get("product_id")
     if pid is None:
         return error_response(400, "VALIDATION_ERROR", "任务缺少产品ID")
-    p = get_product(pid)
+    p = get_product(int(pid))
     if not p:
         return error_response(404, "NOT_FOUND", "资源不存在")
-    now = now_iso()
     SB.table("tasks").update({"status": "running", "updated_at": now, "started_at": now}).eq("id", task_id).execute()
     rlast = SB.table("prices").select("price,created_at").eq("product_id", pid).order("created_at", desc=True).limit(1).execute()
     last_rows = getattr(rlast, "data", None) or []
@@ -879,8 +1136,8 @@ def execute_task(task_id: int):
     curr_minute = now[:16]
     if not prev_rows or not (prev_price == price and prev_minute == curr_minute):
         SB.table("prices").insert({"product_id": pid, "price": price, "created_at": now}).execute()
-        evaluate_alerts_for_product(pid, price, now)
-    SB.table("products").update({"updated_at": now}).eq("id", pid).execute()
+        evaluate_alerts_for_product(int(pid), price, now)
+    SB.table("products").update({"updated_at": now}).eq("id", int(pid)).execute()
     SB.table("tasks").update({"status": "completed", "updated_at": now, "completed_at": now}).eq("id", task_id).execute()
     t2 = SB.table("tasks").select("*").eq("id", task_id).limit(1).execute()
     rows = getattr(t2, "data", None) or []
@@ -1180,6 +1437,200 @@ def graphql_endpoint(payload: dict = Body(...)):
             if p:
                 items.append(p)
         return resp({"getManyProducts": {"items": items}})
+    if "alerts" in query and "mutation" not in query:
+        user_id = variables.get("user_id")
+        product_id = variables.get("product_id")
+        q = SB.table("alerts").select("*").order("id", desc=True)
+        if user_id is not None:
+            q = q.eq("user_id", user_id)
+        if product_id is not None:
+            q = q.eq("product_id", product_id)
+        res = q.execute()
+        items = getattr(res, "data", None) or []
+        return resp({"alerts": items})
+    if "createAlert" in query:
+        input = variables.get("input") or {}
+        now = now_iso()
+        rt = str(input.get("rule_type")) if input.get("rule_type") is not None else ""
+        if rt not in {"price_below", "price_above", "percent_drop", "percent_rise"}:
+            return resp({"createAlert": None})
+        if not get_product(int(input.get("product_id"))):
+            return resp({"createAlert": None})
+        res = SB.table("alerts").insert({
+            "user_id": input.get("user_id"),
+            "product_id": input.get("product_id"),
+            "rule_type": input.get("rule_type"),
+            "threshold": input.get("threshold"),
+            "percent": input.get("percent"),
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+            "channel": input.get("channel") or "inapp",
+            "cooldown_minutes": input.get("cooldown_minutes") or 60,
+            "target": input.get("target"),
+        }).select("*").execute()
+        data = getattr(res, "data", None) or []
+        return resp({"createAlert": (data[0] if data else None)})
+    if "updateAlertStatus" in query:
+        alert_id = int(variables.get("id"))
+        status = str(variables.get("status"))
+        if status not in {"active", "paused"}:
+            return resp({"updateAlertStatus": None})
+        now = now_iso()
+        SB.table("alerts").update({"status": status, "updated_at": now}).eq("id", alert_id).execute()
+        res = SB.table("alerts").select("*").eq("id", alert_id).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        return resp({"updateAlertStatus": (data[0] if data else None)})
+    if "deleteAlert" in query:
+        alert_id = int(variables.get("id"))
+        SB.table("alerts").delete().eq("id", alert_id).execute()
+        return resp({"deleteAlert": {"id": alert_id}})
+    if "alertEvents" in query and "mutation" not in query:
+        alert_id = int(variables.get("alert_id"))
+        page = int(variables.get("page", 1))
+        size = int(variables.get("size", 20))
+        status = variables.get("status")
+        offset = (page - 1) * size
+        q = SB.table("alert_events").select("*", count="exact").eq("alert_id", alert_id).order("id", desc=True)
+        if status:
+            q = q.eq("status", status)
+        res = q.range(offset, offset + size - 1).execute()
+        items = getattr(res, "data", None) or []
+        total = getattr(res, "count", 0) or len(items)
+        return resp({"alertEvents": {"items": items, "total": total, "page": page, "size": size}})
+    if "updateAlert" in query:
+        alert_id = int(variables.get("id"))
+        input = variables.get("input") or {}
+        now = now_iso()
+        payload = {}
+        if input.get("threshold") is not None:
+            payload["threshold"] = input.get("threshold")
+        if input.get("channel") is not None:
+            payload["channel"] = input.get("channel")
+        if input.get("cooldown_minutes") is not None:
+            payload["cooldown_minutes"] = input.get("cooldown_minutes")
+        if not payload:
+            return resp({"updateAlert": {"id": alert_id}})
+        payload["updated_at"] = now
+        SB.table("alerts").update(payload).eq("id", alert_id).execute()
+        return resp({"updateAlert": {"id": alert_id}})
+    if "updateAlertTarget" in query:
+        alert_id = int(variables.get("id"))
+        target = variables.get("target")
+        now = now_iso()
+        SB.table("alerts").update({"target": target, "updated_at": now}).eq("id", alert_id).execute()
+        return resp({"updateAlertTarget": {"id": alert_id, "target": target}})
+    if "userCollections" in query and "mutation" not in query:
+        user_id = int(variables.get("user_id"))
+        page = int(variables.get("page", 1))
+        size = int(variables.get("size", 20))
+        search = variables.get("search")
+        links = SB.table("collection_members").select("collection_id").eq("user_id", user_id).execute()
+        ids = [x.get("collection_id") for x in (getattr(links, "data", None) or [])]
+        if not ids:
+            return resp({"userCollections": {"items": [], "page": page, "size": size, "total": 0}})
+        offset = (page - 1) * size
+        q = SB.table("collections").select("id,name,created_at", count="exact").in_("id", ids).order("id", desc=True)
+        if search:
+            q = q.ilike("name", f"%{search}%")
+        res = q.range(offset, offset + size - 1).execute()
+        items = getattr(res, "data", None) or []
+        total = getattr(res, "count", 0) or len(items)
+        return resp({"userCollections": {"items": items, "page": page, "size": size, "total": total}})
+    if "collection(" in query and "mutation" not in query:
+        cid = int(variables.get("id"))
+        cres = SB.table("collections").select("id,name,owner_user_id,created_at").eq("id", cid).limit(1).execute()
+        citems = getattr(cres, "data", None) or []
+        if not citems:
+            return resp({"collection": None})
+        c = citems[0]
+        links = SB.table("collection_products").select("product_id").eq("collection_id", cid).order("id", desc=True).execute()
+        pids = [x.get("product_id") for x in (getattr(links, "data", None) or [])]
+        products = []
+        if pids:
+            pres = SB.table("products").select("*").in_("id", pids).execute()
+            products = [{"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")} for r in (getattr(pres, "data", None) or [])]
+        ms = SB.table("collection_members").select("user_id,role").eq("collection_id", cid).execute()
+        uids = [x.get("user_id") for x in (getattr(ms, "data", None) or [])]
+        members = []
+        if uids:
+            ures = SB.table("users").select("id,username,display_name").in_("id", uids).execute()
+            udata = getattr(ures, "data", None) or []
+            roles = {x.get("user_id"): x.get("role") for x in (getattr(ms, "data", None) or [])}
+            members = [{"id": u.get("id"), "username": u.get("username"), "display_name": u.get("display_name"), "role": roles.get(u.get("id"))} for u in udata]
+        return resp({"collection": {"id": c.get("id"), "name": c.get("name"), "owner_user_id": c.get("owner_user_id"), "created_at": c.get("created_at"), "products": products, "members": members}})
+    if "addCollectionProduct" in query:
+        cid = int(variables.get("collection_id"))
+        pid = int(variables.get("product_id"))
+        if not get_product(pid):
+            return resp({"addCollectionProduct": None})
+        cres = SB.table("collections").select("id").eq("id", cid).limit(1).execute()
+        if not (getattr(cres, "data", None) or []):
+            return resp({"addCollectionProduct": None})
+        try:
+            SB.table("collection_products").insert({"collection_id": cid, "product_id": pid}).execute()
+        except Exception:
+            return resp({"addCollectionProduct": None})
+        return resp({"addCollectionProduct": {"collection_id": cid, "product_id": pid}})
+    if "removeCollectionProduct" in query:
+        cid = int(variables.get("collection_id"))
+        pid = int(variables.get("product_id"))
+        SB.table("collection_products").delete().eq("collection_id", cid).eq("product_id", pid).execute()
+        return resp({"removeCollectionProduct": {"collection_id": cid, "product_id": pid}})
+    if "shareCollection" in query:
+        cid = int(variables.get("collection_id"))
+        input = variables.get("input") or {}
+        uid = int(input.get("user_id"))
+        role = input.get("role") if input.get("role") in {"admin", "editor", "viewer"} else "editor"
+        cres = SB.table("collections").select("id").eq("id", cid).limit(1).execute()
+        if not (getattr(cres, "data", None) or []):
+            return resp({"shareCollection": None})
+        ures = SB.table("users").select("id").eq("id", uid).limit(1).execute()
+        if not (getattr(ures, "data", None) or []):
+            return resp({"shareCollection": None})
+        try:
+            SB.table("collection_members").insert({"collection_id": cid, "user_id": uid, "role": role}).execute()
+        except Exception:
+            return resp({"shareCollection": None})
+        return resp({"shareCollection": {"collection_id": cid, "user_id": uid, "role": role}})
+    if "userPushes" in query and "mutation" not in query:
+        user_id = int(variables.get("user_id"))
+        box = variables.get("box")
+        q = SB.table("pushes").select("*").order("id", desc=True)
+        if box == "outbox":
+            q = q.eq("sender_id", user_id)
+        else:
+            q = q.eq("recipient_id", user_id)
+        res = q.execute()
+        items = getattr(res, "data", None) or []
+        return resp({"userPushes": items})
+    if "updatePushStatus" in query:
+        push_id = int(variables.get("id"))
+        status = str(variables.get("status"))
+        if status not in {"accepted", "rejected"}:
+            return resp({"updatePushStatus": None})
+        now = now_iso()
+        SB.table("pushes").update({"status": status, "updated_at": now}).eq("id", push_id).execute()
+        res = SB.table("pushes").select("*").eq("id", push_id).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        return resp({"updatePushStatus": (data[0] if data else None)})
+    if "createPush" in query:
+        sender_id = int(variables.get("sender_id"))
+        input = variables.get("input") or {}
+        now = now_iso()
+        if not get_product(int(input.get("product_id"))):
+            return resp({"createPush": None})
+        res = SB.table("pushes").insert({
+            "sender_id": sender_id,
+            "recipient_id": input.get("recipient_id"),
+            "product_id": input.get("product_id"),
+            "message": input.get("message"),
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+        }).select("*").execute()
+        data = getattr(res, "data", None) or []
+        return resp({"createPush": (data[0] if data else None)})
     return resp({})
 
 app.include_router(router)
