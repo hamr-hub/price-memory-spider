@@ -47,6 +47,12 @@ class NodeRuntime:
         self._ensure_node()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         threading.Thread(target=self._command_loop, daemon=True).start()
+        threading.Thread(target=self._retry_loop, daemon=True).start()
+        try:
+            if str(os.environ.get("AUTO_CONSUME_QUEUE") or "").lower() in {"1","true","yes"}:
+                threading.Thread(target=self._queue_loop, daemon=True).start()
+        except Exception:
+            pass
 
     def stop(self):
         self._stop = True
@@ -124,6 +130,42 @@ class NodeRuntime:
                 pass
             time.sleep(2)
 
+    def _retry_loop(self):
+        while not self._stop:
+            try:
+                self._reschedule_failed()
+            except Exception:
+                pass
+            time.sleep(5)
+
+    def _reschedule_failed(self):
+        if not self.client or not self.node_id:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            r = (
+                self.client
+                .table("node_commands")
+                .select("id")
+                .eq("node_id", self.node_id)
+                .eq("status", "failed")
+                .or(f"next_retry_at.is.null,next_retry_at.lte.{now}")
+                .limit(50)
+                .execute()
+            )
+            rows = getattr(r, "data", []) or []
+            for row in rows:
+                try:
+                    self.client.table("node_commands").update({
+                        "status": "pending",
+                        "locked_by": None,
+                        "locked_at": None,
+                    }).eq("id", row.get("id")).eq("status", "failed").execute()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _consume_commands(self):
         if not self.client or not self.node_id:
             return
@@ -131,10 +173,11 @@ class NodeRuntime:
         r = (
             self.client
             .table("node_commands")
-            .select("id,command,payload,priority,scheduled_at")
+            .select("id,command,payload,priority,scheduled_at,next_retry_at,status,locked_by,attempt_count")
             .eq("node_id", self.node_id)
             .eq("status", "pending")
             .or(f"scheduled_at.is.null,scheduled_at.lte.{now}")
+            .or(f"next_retry_at.is.null,next_retry_at.lte.{now}")
             .order("priority", desc=True)
             .order("scheduled_at", desc=False)
             .order("id", desc=False)
@@ -151,18 +194,27 @@ class NodeRuntime:
                 sch = row.get("scheduled_at")
                 if sch and str(sch) > now:
                     continue
+                nr = row.get("next_retry_at")
+                if nr and str(nr) > now:
+                    continue
+                if row.get("locked_by"):
+                    continue
             except Exception:
                 pass
             try:
                 self.client.table("node_commands").update({
                     "status": "processing",
-                }).eq("id", row.get("id")).execute()
+                    "locked_by": self.node_id,
+                    "locked_at": datetime.now(timezone.utc).isoformat(),
+                    "attempt_count": int(row.get("attempt_count") or 0) + 1,
+                }).eq("id", row.get("id")).eq("status", "pending").execute()
             except Exception:
                 pass
             threading.Thread(target=self._handle_command, args=(row,), daemon=True).start()
             self._running += 1
 
     def _handle_command(self, row: dict):
+        ok = True
         try:
             cmd = row.get("command")
             payload = row.get("payload") or {}
@@ -206,6 +258,7 @@ class NodeRuntime:
                         attempt += 1
                 if last_err:
                     self._log(job_id, "error", f"最终失败: {str(last_err)}")
+                    ok = False
             elif cmd == "test_steps":
                 job_id = payload.get("job_id") or str(uuid.uuid4())
                 url = payload.get("url") or "https://example.com"
@@ -227,6 +280,7 @@ class NodeRuntime:
                         attempt += 1
                 if last_err:
                     self._log(job_id, "error", f"步骤最终失败: {str(last_err)}")
+                    ok = False
             elif cmd == "codegen":
                 url = payload.get("url") or "https://example.com"
                 job_id = payload.get("job_id") or str(uuid.uuid4())
@@ -241,10 +295,24 @@ class NodeRuntime:
                     self._run_convert_codegen(script_url, job_id, target)
         finally:
             try:
-                self.client.table("node_commands").update({
-                    "status": "processed",
-                    "processed_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", row.get("id")).execute()
+                if ok:
+                    self.client.table("node_commands").update({
+                        "status": "processed",
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "locked_by": None,
+                        "locked_at": None,
+                    }).eq("id", row.get("id")).execute()
+                else:
+                    ac = int(row.get("attempt_count") or 1)
+                    backoff = min(300, 2 ** min(ac, 10))
+                    nxt = datetime.now(timezone.utc) + __import__("datetime").timedelta(seconds=backoff)
+                    self.client.table("node_commands").update({
+                        "status": "failed",
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "next_retry_at": nxt.isoformat(),
+                        "locked_by": None,
+                        "locked_at": None,
+                    }).eq("id", row.get("id")).execute()
             except Exception:
                 pass
             self._running = max(0, self._running - 1)
@@ -345,13 +413,47 @@ class NodeRuntime:
                     total = len(entries)
                     status2 = {}
                     bytes_sum = 0
+                    ttfb = []
+                    fails = {}
+                    redirects = []
                     for e in entries:
                         st = int((e.get("response", {}) or {}).get("status", 0) or 0)
                         status2[st] = status2.get(st, 0) + 1
                         cont = (e.get("response", {}) or {}).get("content", {}) or {}
                         sz = int(cont.get("size", 0) or 0)
                         bytes_sum += sz
+                        tm = (e.get("timings", {}) or {})
+                        w = tm.get("wait")
+                        if isinstance(w, (int, float)) and w >= 0:
+                            ttfb.append(float(w))
+                        try:
+                            req = e.get("request", {}) or {}
+                            u = str(req.get("url") or "")
+                            dom = u.split("//", 1)[-1].split("/", 1)[0]
+                        except Exception:
+                            dom = ""
+                        if st >= 400 and dom:
+                            fails[dom] = fails.get(dom, 0) + 1
+                        if 300 <= st < 400:
+                            hdrs = (e.get("response", {}) or {}).get("headers", []) or []
+                            loc = None
+                            for h in hdrs:
+                                k = str(h.get("name") or "").lower()
+                                if k == "location":
+                                    loc = h.get("value")
+                                    break
+                            req = e.get("request", {}) or {}
+                            ru = str(req.get("url") or "")
+                            if loc:
+                                redirects.append({"from": ru, "to": loc})
                     self._log(job_id, "metric", json.dumps({"type": "har_summary", "requests": total, "status_counts": status2, "bytes": bytes_sum}))
+                    if ttfb:
+                        s = sorted(ttfb)
+                        avg = sum(s) / len(s)
+                        p95 = s[int(max(0, min(len(s)-1, round(len(s)*0.95))))]
+                        top_fail = sorted(fails.items(), key=lambda x: x[1], reverse=True)[:10]
+                        red = redirects[:20]
+                        self._log(job_id, "metric", json.dumps({"type": "har_details", "ttfb_avg_ms": round(avg,2), "ttfb_p95_ms": round(p95,2), "fail_domains": [{"domain": d, "count": c} for d,c in top_fail], "redirects": red}))
                 except Exception:
                     pass
                 self._log(job_id, "artifact", json.dumps({"type": "har", "url": urlh}))
@@ -384,6 +486,27 @@ class NodeRuntime:
         except Exception:
             pass
 
+    def _queue_loop(self):
+        base = os.environ.get("API_BASE_URL") or "http://127.0.0.1:8000/api/v1"
+        while not self._stop:
+            try:
+                if self._paused:
+                    time.sleep(2)
+                    continue
+                import urllib.request
+                req = urllib.request.Request(base + "/spider/tasks/next/execute", method="POST")
+                r = urllib.request.urlopen(req, timeout=5)
+                txt = r.read().decode("utf-8", errors="ignore")
+                try:
+                    obj = json.loads(txt)
+                    did = (obj.get("data") or {}).get("id")
+                    if did:
+                        self._log(str(did), "info", "队列任务已执行")
+                except Exception:
+                    pass
+            except Exception:
+                time.sleep(2)
+            time.sleep(2)
     def _select_proxy(self, key: str) -> Optional[str]:
         try:
             if not self._proxies:
@@ -415,6 +538,13 @@ class NodeRuntime:
                         page.goto(str(step.get("url") or val or url))
                     elif act == "wait_for_selector":
                         page.wait_for_selector(str(sel))
+                    elif act == "by_role_wait":
+                        role = (step or {}).get("role")
+                        name = (step or {}).get("name")
+                        page.get_by_role(str(role or "button"), { "name": str(name or "") }).wait_for()
+                    elif act == "by_text_wait":
+                        text = (step or {}).get("text") or val
+                        page.get_by_text(str(text or "")).wait_for()
                     elif act == "click":
                         page.click(str(sel))
                     elif act == "fill":
@@ -424,6 +554,17 @@ class NodeRuntime:
                     elif act == "evaluate_text":
                         txt = page.text_content(str(sel))
                         outputs.append({"type": "text", "selector": sel, "value": txt})
+                    elif act == "hover":
+                        page.hover(str(sel))
+                    elif act == "press":
+                        page.press(str(sel), str(val or ""))
+                    elif act == "by_role_click":
+                        role = (step or {}).get("role")
+                        name = (step or {}).get("name")
+                        page.get_by_role(str(role or "button"), { "name": str(name or "") }).click()
+                    elif act == "by_text_click":
+                        text = (step or {}).get("text") or val
+                        page.get_by_text(str(text or "")).click()
                     elif act == "screenshot":
                         tmpdir = tempfile.mkdtemp(prefix=f"pm_{job_id}_shot_")
                         shot = os.path.join(tmpdir, f"shot_{idx+1}.png")

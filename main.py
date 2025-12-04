@@ -4,7 +4,7 @@ import datetime
 import random
 from typing import Any, List, Optional, Dict
 from fastapi import FastAPI, APIRouter, Query, Header
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from fastapi import Body
 import secrets
 from pydantic import BaseModel
@@ -73,6 +73,8 @@ def ok(data: Any, message: str = "操作成功"):
     return {"success": True, "data": data, "message": message, "timestamp": now_iso()}
 
 def error_response(status_code: int, code: str, message: str, details: Optional[List[Any]] = None):
+    if os.getenv("STRICT_HTTP") == "1":
+        return JSONResponse(status_code=status_code, content={"success": False, "error": {"code": code, "message": message, "details": details or []}, "timestamp": now_iso()})
     return {"success": False, "error": {"code": code, "message": message, "details": details or []}, "timestamp": now_iso()}
 
 
@@ -108,10 +110,14 @@ def row_to_price(r: dict) -> dict:
 
 def create_product(name: str, url: str, category: Optional[str] = None) -> int:
     if SB:
-        now = now_iso()
-        res = SB.table("products").insert({"name": name, "url": url, "category": category, "updated_at": now}).select("id").execute()
-        data = getattr(res, "data", None) or []
-        return int(data[0]["id"]) if data else 0
+        try:
+            now = now_iso()
+            res = SB.table("products").insert({"name": name, "url": url, "category": category, "updated_at": now}).select("id").execute()
+            data = getattr(res, "data", None) or []
+            if data:
+                return int(data[0]["id"]) if data else 0
+        except Exception:
+            pass
     conn = get_conn()
     cur = conn.cursor()
     now = now_iso()
@@ -123,12 +129,14 @@ def create_product(name: str, url: str, category: Optional[str] = None) -> int:
 
 def get_product(product_id: int) -> Optional[dict]:
     if SB:
-        res = SB.table("products").select("*").eq("id", product_id).limit(1).execute()
-        data = getattr(res, "data", None) or []
-        if not data:
-            return None
-        r = data[0]
-        return {"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")}
+        try:
+            res = SB.table("products").select("*").eq("id", product_id).limit(1).execute()
+            data = getattr(res, "data", None) or []
+            if data:
+                r = data[0]
+                return {"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")}
+        except Exception:
+            pass
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM products WHERE id = ?", (product_id,))
@@ -198,10 +206,23 @@ class AlertStatusUpdate(BaseModel):
     status: str
 
 app = FastAPI()
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception:
+    pass
 router = APIRouter(prefix="/api/v1")
 RATE_LIMIT: Dict[str, float] = {}
 def _is_node_paused() -> bool:
     try:
+        if str(os.environ.get("NODE_PAUSED") or "").strip() == "1":
+            return True
         import socket
         name = os.environ.get("NODE_NAME") or f"node-{socket.gethostname()}"
         src_path = os.path.join(BASE_DIR, "src")
@@ -725,36 +746,98 @@ def create_collection(body: CollectionCreate):
     return ok({"id": cid, "name": body.name, "owner_user_id": body.owner_user_id, "created_at": now})
 
 @router.get("/users/{user_id}/collections")
-def list_user_collections(user_id: int, page: int = Query(1, ge=1), size: int = Query(20, ge=1, le=100), search: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, min_members: Optional[int] = None, max_members: Optional[int] = None):
+def list_user_collections(
+    user_id: int,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_members: Optional[int] = None,
+    max_members: Optional[int] = None,
+    owner_only: Optional[bool] = None,
+    owner_id: Optional[int] = None,
+    min_products: Optional[int] = None,
+    max_products: Optional[int] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = None,
+):
     links = SB.table("collection_members").select("collection_id").eq("user_id", user_id).execute()
     ids = [x.get("collection_id") for x in (getattr(links, "data", None) or [])]
     if not ids:
         return ok({"items": [], "page": page, "size": size, "total": 0, "pages": 0})
     offset = (page - 1) * size
-    q = SB.table("collections").select("id,name,created_at", count="exact").in_("id", ids).order("id", desc=True)
+    q = SB.table("collections").select("id,name,created_at,owner_user_id", count="exact").in_("id", ids)
     if search:
         q = q.ilike("name", f"%{search}%")
+    # base order by created_at desc unless overridden by sort
+    q = q.order("created_at", desc=True)
     res = q.range(offset, offset + size - 1).execute()
     items = getattr(res, "data", None) or []
     total = getattr(res, "count", 0) or len(items)
-    if start_date or end_date or (min_members is not None) or (max_members is not None):
-        if start_date:
-            items = [r for r in items if str(r.get("created_at"))[:10] >= start_date]
-        if end_date:
-            items = [r for r in items if str(r.get("created_at"))[:10] <= end_date]
-        cids = [r.get("id") for r in items]
-        if cids:
-            mres = SB.table("collection_members").select("collection_id", count="exact").in_("collection_id", cids).execute()
-            mitems = getattr(mres, "data", None) or []
-            counts: Dict[int, int] = {}
-            for r in mitems:
-                cid = int(r.get("collection_id"))
-                counts[cid] = counts.get(cid, 0) + 1
-            if min_members is not None:
-                items = [r for r in items if counts.get(int(r.get("id")), 0) >= int(min_members)]
-            if max_members is not None:
-                items = [r for r in items if counts.get(int(r.get("id")), 0) <= int(max_members)]
-        total = len(items)
+    # owner filters
+    if owner_only:
+        items = [r for r in items if int(r.get("owner_user_id") or 0) == int(user_id)]
+    if owner_id is not None:
+        items = [r for r in items if int(r.get("owner_user_id") or 0) == int(owner_id)]
+    # date filters
+    if start_date:
+        items = [r for r in items if str(r.get("created_at"))[:10] >= start_date]
+    if end_date:
+        items = [r for r in items if str(r.get("created_at"))[:10] <= end_date]
+    cids = [int(r.get("id")) for r in items]
+    members_count: Dict[int, int] = {}
+    products_count: Dict[int, int] = {}
+    last_updated_map: Dict[int, str] = {}
+    if cids:
+        # member counts
+        mres = SB.table("collection_members").select("collection_id").in_("collection_id", cids).execute()
+        for r in (getattr(mres, "data", None) or []):
+            cid = int(r.get("collection_id"))
+            members_count[cid] = members_count.get(cid, 0) + 1
+        # product counts and last updated
+        pres = SB.table("collection_products").select("collection_id,product_id").in_("collection_id", cids).execute()
+        cp = getattr(pres, "data", None) or []
+        by_cid: Dict[int, List[int]] = {}
+        pid_set: set = set()
+        for r in cp:
+            cid = int(r.get("collection_id"))
+            pid = int(r.get("product_id"))
+            by_cid.setdefault(cid, []).append(pid)
+            pid_set.add(pid)
+        if pid_set:
+            prows = getattr(SB.table("products").select("id,updated_at").in_("id", list(pid_set)).execute(), "data", None) or []
+            updated_map: Dict[int, str] = {int(p.get("id")): str(p.get("updated_at") or "") for p in prows}
+            for cid, pids in by_cid.items():
+                products_count[cid] = len(pids)
+                # compute max updated_at
+                last = ""
+                for pid in pids:
+                    up = updated_map.get(pid) or ""
+                    if up and (not last or up > last):
+                        last = up
+                last_updated_map[cid] = last
+    # members filters
+    if min_members is not None:
+        items = [r for r in items if members_count.get(int(r.get("id")), 0) >= int(min_members)]
+    if max_members is not None:
+        items = [r for r in items if members_count.get(int(r.get("id")), 0) <= int(max_members)]
+    # products filters
+    if min_products is not None:
+        items = [r for r in items if products_count.get(int(r.get("id")), 0) >= int(min_products)]
+    if max_products is not None:
+        items = [r for r in items if products_count.get(int(r.get("id")), 0) <= int(max_products)]
+    # sorting
+    if sort_by in {"last_updated", "created_at", "name"}:
+        reverse = True if sort_order == "desc" else False
+        if sort_by == "last_updated":
+            items.sort(key=lambda r: (last_updated_map.get(int(r.get("id"))) or ""), reverse=reverse)
+        elif sort_by == "created_at":
+            items.sort(key=lambda r: str(r.get("created_at") or ""), reverse=reverse)
+        else:
+            items.sort(key=lambda r: str(r.get("name") or ""), reverse=reverse)
+    total = len(items)
+    return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
     return ok({"items": items, "page": page, "size": size, "total": total, "pages": math.ceil(total / size) if size else 0})
 
 @router.get("/collections/{collection_id}")
@@ -1186,8 +1269,17 @@ def send_email(to_addr: str, subject: str, body: str):
 def send_webhook(url: str, payload: dict):
     import json
     import urllib.request
+    import hmac
+    import hashlib
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    ts = now_iso()
+    secret = os.getenv("ALERT_WEBHOOK_SECRET")
+    if secret:
+        sig = hmac.new(secret.encode("utf-8"), data, hashlib.sha256).hexdigest()
+        headers["X-Signature"] = sig
+        headers["X-Timestamp"] = ts
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=5) as resp:
         if resp.status < 200 or resp.status >= 300:
             raise RuntimeError(f"Webhook返回状态码{resp.status}")
@@ -1231,7 +1323,7 @@ def evaluate_alerts_for_product(product_id: int, price: float, now: str):
             except Exception as e:
                 status = "failed"
                 err = str(e)
-            SB.table("alert_events").insert({"alert_id": a.get("id"), "product_id": product_id, "user_id": uid, "price": price, "created_at": now, "message": "触发", "channel": channel, "push_id": push_id, "status": status, "error": err}).execute()
+            SB.table("alert_events").insert({"alert_id": a.get("id"), "product_id": product_id, "user_id": uid, "price": price, "created_at": now, "message": "触发", "channel": channel, "push_id": push_id, "status": status, "error": err, "attempt": 1}).execute()
             SB.table("alerts").update({"last_triggered_at": now, "updated_at": now}).eq("id", a.get("id")).execute()
 
 @router.post("/alert_events/{event_id}/retry")
@@ -1266,8 +1358,26 @@ def retry_alert_event(event_id: int):
     except Exception as e:
         status = "failed"
         err = str(e)
-    SB.table("alert_events").insert({"alert_id": aid, "product_id": product_id, "user_id": uid, "price": price, "created_at": now, "message": "重试", "channel": channel, "push_id": push_id, "status": status, "error": err}).execute()
+    SB.table("alert_events").insert({"alert_id": aid, "product_id": product_id, "user_id": uid, "price": price, "created_at": now, "message": "重试", "channel": channel, "push_id": push_id, "status": status, "error": err, "attempt": (int(e.get("attempt") or 1) + 1)}).execute()
     return ok({"event_id": event_id, "status": status})
+
+@router.get("/alerts/{alert_id}/events.csv")
+def export_alert_events_csv(alert_id: int, status: Optional[str] = None):
+    import csv
+    import io
+    q = SB.table("alert_events").select("*").eq("alert_id", alert_id).order("id", desc=True)
+    if status:
+        q = q.eq("status", status)
+    res = q.execute()
+    items = getattr(res, "data", None) or []
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["id", "created_at", "price", "channel", "status", "error", "attempt"]) 
+    for e in items:
+        w.writerow([e.get("id"), e.get("created_at"), e.get("price"), e.get("channel"), e.get("status"), e.get("error"), e.get("attempt")])
+    csv_content = output.getvalue()
+    filename = f"alert_{alert_id}_events.csv"
+    return Response(content=csv_content, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @router.post("/spider/listing")
 def listing(body: ListingRequest):
@@ -1377,14 +1487,21 @@ def graphql_endpoint(payload: dict = Body(...)):
     if "products" in query and "mutation" not in query:
         page = int(variables.get("page", 1))
         size = int(variables.get("size", 20))
-        conn = get_conn()
-        cur = conn.cursor()
-        total = cur.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        offset = (page - 1) * size
-        cur.execute("SELECT * FROM products ORDER BY id DESC LIMIT ? OFFSET ?", (size, offset))
-        items = [row_to_product(r) for r in cur.fetchall()]
-        conn.close()
-        return resp({"products": {"items": items, "total": total, "page": page, "size": size}})
+        if SB is not None:
+            offset = (page - 1) * size
+            sel = SB.table("products").select("*", count="exact").order("id", desc=True).range(offset, offset + size - 1).execute()
+            items = [{"id": r.get("id"), "name": r.get("name"), "url": r.get("url"), "category": r.get("category"), "last_updated": r.get("updated_at")} for r in (getattr(sel, "data", None) or [])]
+            total = getattr(sel, "count", 0) or len(items)
+            return resp({"products": {"items": items, "total": total, "page": page, "size": size}})
+        else:
+            conn = get_conn()
+            cur = conn.cursor()
+            total = cur.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+            offset = (page - 1) * size
+            cur.execute("SELECT * FROM products ORDER BY id DESC LIMIT ? OFFSET ?", (size, offset))
+            items = [row_to_product(r) for r in cur.fetchall()]
+            conn.close()
+            return resp({"products": {"items": items, "total": total, "page": page, "size": size}})
     if "product(" in query and "mutation" not in query:
         pid = int(variables.get("id"))
         p = get_product(pid)
@@ -1397,12 +1514,17 @@ def graphql_endpoint(payload: dict = Body(...)):
         return resp({"product": p})
     if "productPrices" in query:
         pid = int(variables.get("product_id"))
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM prices WHERE product_id = ? ORDER BY created_at DESC", (pid,))
-        items = [row_to_price(r) for r in cur.fetchall()]
-        conn.close()
-        return resp({"productPrices": items})
+        if SB is not None:
+            res = SB.table("prices").select("*").eq("product_id", pid).order("created_at", desc=True).execute()
+            items = [{"id": r.get("id"), "product_id": r.get("product_id"), "price": r.get("price"), "created_at": r.get("created_at")} for r in (getattr(res, "data", None) or [])]
+            return resp({"productPrices": items})
+        else:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM prices WHERE product_id = ? ORDER BY created_at DESC", (pid,))
+            items = [row_to_price(r) for r in cur.fetchall()]
+            conn.close()
+            return resp({"productPrices": items})
     if "createProduct" in query:
         input = variables.get("input") or {}
         pid = create_product(input.get("name"), input.get("url"), input.get("category"))
@@ -1410,25 +1532,35 @@ def graphql_endpoint(payload: dict = Body(...)):
     if "updateProduct" in query:
         pid = int(variables.get("id"))
         input = variables.get("input") or {}
-        conn = get_conn()
-        cur = conn.cursor()
         now = now_iso()
-        cur.execute("UPDATE products SET name = COALESCE(?, name), url = COALESCE(?, url), category = COALESCE(?, category), last_updated = ? WHERE id = ?", (input.get("name"), input.get("url"), input.get("category"), now, pid))
-        conn.commit()
-        cur.execute("SELECT * FROM products WHERE id = ?", (pid,))
-        r = cur.fetchone()
-        conn.close()
-        return resp({"updateProduct": row_to_product(r) if r else None})
+        if SB is not None:
+            SB.table("products").update({"name": input.get("name"), "url": input.get("url"), "category": input.get("category"), "updated_at": now}).eq("id", pid).execute()
+            return resp({"updateProduct": get_product(pid)})
+        else:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("UPDATE products SET name = COALESCE(?, name), url = COALESCE(?, url), category = COALESCE(?, category), last_updated = ? WHERE id = ?", (input.get("name"), input.get("url"), input.get("category"), now, pid))
+            conn.commit()
+            cur.execute("SELECT * FROM products WHERE id = ?", (pid,))
+            r = cur.fetchone()
+            conn.close()
+            return resp({"updateProduct": row_to_product(r) if r else None})
     if "deleteProduct" in query:
         pid = int(variables.get("id"))
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM prices WHERE product_id = ?", (pid,))
-        cur.execute("DELETE FROM tasks WHERE product_id = ?", (pid,))
-        cur.execute("DELETE FROM products WHERE id = ?", (pid,))
-        conn.commit()
-        conn.close()
-        return resp({"deleteProduct": {"id": pid}})
+        if SB is not None:
+            SB.table("prices").delete().eq("product_id", pid).execute()
+            SB.table("tasks").delete().eq("product_id", pid).execute()
+            SB.table("products").delete().eq("id", pid).execute()
+            return resp({"deleteProduct": {"id": pid}})
+        else:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM prices WHERE product_id = ?", (pid,))
+            cur.execute("DELETE FROM tasks WHERE product_id = ?", (pid,))
+            cur.execute("DELETE FROM products WHERE id = ?", (pid,))
+            conn.commit()
+            conn.close()
+            return resp({"deleteProduct": {"id": pid}})
     if "getManyProducts" in query:
         ids = variables.get("ids") or []
         items = []
@@ -1648,3 +1780,36 @@ def main():
 
 if __name__ == "__main__":
     main()
+@router.get("/products/{product_id}/export/xlsx")
+def export_product_prices_xlsx(product_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None, api_key: Optional[str] = Header(None)):
+    p = get_product(product_id)
+    if not p:
+        return error_response(404, "NOT_FOUND", "资源不存在")
+    user = get_user_by_api_key(api_key)
+    if user:
+        reset_user_quota_if_needed(int(user["id"]))
+        quota = user.get("quota_exports_per_day") or 0
+        used = user.get("exports_used_today") or 0
+        if quota and (used + 1) > quota:
+            return error_response(429, "QUOTA_EXCEEDED", "导出额度已用尽")
+    from openpyxl import Workbook
+    import io
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (p.get("name") or f"product_{product_id}")[:31].replace("/", "-")
+    ws.append(["product_id", "product_name", "url", "category", "price_id", "price", "created_at"])
+    q = SB.table("prices").select("id,price,created_at").eq("product_id", product_id).order("created_at", desc=True)
+    if start_date:
+        q = q.gte("created_at", start_date)
+    if end_date:
+        q = q.lte("created_at", end_date + " 23:59:59")
+    rows = getattr(q.execute(), "data", None) or []
+    for r in rows:
+        ws.append([product_id, p["name"], p["url"], p["category"], r.get("id"), r.get("price"), r.get("created_at")])
+    buf = io.BytesIO()
+    wb.save(buf)
+    content = buf.getvalue()
+    if user:
+        SB.table("users").update({"exports_used_today": (user.get("exports_used_today") or 0) + 1, "last_quota_reset": datetime.datetime.utcnow().date().isoformat()}).eq("id", int(user["id"])).execute()
+    filename = f"product_{product_id}_prices.xlsx"
+    return Response(content=content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
