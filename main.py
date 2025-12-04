@@ -205,6 +205,10 @@ class AlertCreate(BaseModel):
 class AlertStatusUpdate(BaseModel):
     status: str
 
+class PreferencesUpdate(BaseModel):
+    trend_ma_window: Optional[int] = None
+    trend_bb_on: Optional[bool] = None
+
 app = FastAPI()
 try:
     from fastapi.middleware.cors import CORSMiddleware
