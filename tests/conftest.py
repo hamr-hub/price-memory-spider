@@ -4,13 +4,17 @@ import tempfile
 import shutil
 import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-import spider.main as main
+main = None
 
 
 @pytest.fixture(autouse=True)
 def temp_db(monkeypatch):
     tmpdir = tempfile.mkdtemp(prefix="spiderdb_")
     db_path = os.path.join(tmpdir, "spider.db")
+    global main
+    if main is None:
+        import importlib
+        main = importlib.import_module("spider.main")
     monkeypatch.setattr(main, "DB_PATH", db_path, raising=False)
     yield
     try:

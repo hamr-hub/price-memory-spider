@@ -7,11 +7,12 @@ import json
 import uuid
 import tempfile
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from typing import Optional
 from supabase import Client
 from ..dao.supabase_client import get_client
-from ...main import get_conn
+# remove sqlite dependency; use Supabase for counts
 try:
     from ..playwrite.bowser_utils import BowserBrowser
 except Exception:
@@ -28,6 +29,12 @@ class NodeRuntime:
         self.node_id: Optional[int] = None
         self._stop = False
         self._paused = False
+        self._proxies = []
+        try:
+            raw = os.environ.get("HTTP_PROXY_LIST") or os.environ.get("PLAYWRIGHT_PROXIES") or ""
+            self._proxies = [x.strip() for x in raw.split(",") if x.strip()]
+        except Exception:
+            self._proxies = []
         try:
             self._concurrency = int(os.environ.get("NODE_CONCURRENCY") or "1")
         except Exception:
@@ -61,6 +68,7 @@ class NodeRuntime:
         rows = getattr(r, "data", []) or []
         if rows:
             self.node_id = rows[0]["id"]
+        self._refresh_settings_once()
 
     def _heartbeat_loop(self):
         while not self._stop:
@@ -70,21 +78,43 @@ class NodeRuntime:
     def _heartbeat_once(self):
         if not self.client or not self.node_id:
             return
-        conn = get_conn()
-        cur = conn.cursor()
-        running = cur.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
-        pending = cur.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'").fetchone()[0]
-        completed = cur.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'").fetchone()[0]
-        conn.close()
+        try:
+            self._refresh_settings_once()
+        except Exception:
+            pass
+        running = int(self._running or 0)
+        pending_tasks = 0
+        completed_tasks = 0
+        try:
+            rp = self.client.table("tasks").select("id", count="exact").eq("status", "pending").execute()
+            pending_tasks = int(getattr(rp, "count", 0) or 0)
+            rc = self.client.table("tasks").select("id", count="exact").eq("status", "completed").execute()
+            completed_tasks = int(getattr(rc, "count", 0) or 0)
+        except Exception:
+            pending_tasks = 0
+            completed_tasks = 0
         now = datetime.now(timezone.utc).isoformat()
         st = "paused" if self._paused else "online"
         self.client.table("runtime_nodes").update({
             "status": st,
-            "current_tasks": int(running or 0),
-            "queue_size": int(pending or 0),
-            "total_completed": int(completed or 0),
+            "current_tasks": running,
+            "queue_size": pending_tasks,
+            "total_completed": completed_tasks,
             "last_seen": now,
         }).eq("id", self.node_id).execute()
+
+    def _refresh_settings_once(self):
+        if not self.client or not self.node_id:
+            return
+        try:
+            rs = self.client.table("runtime_nodes").select("concurrency").eq("id", self.node_id).limit(1).execute()
+            data = getattr(rs, "data", []) or []
+            if data:
+                c = int((data[0] or {}).get("concurrency") or 0)
+                if c > 0:
+                    self._concurrency = c
+        except Exception:
+            pass
 
     def _command_loop(self):
         while not self._stop:
@@ -97,13 +127,32 @@ class NodeRuntime:
     def _consume_commands(self):
         if not self.client or not self.node_id:
             return
-        r = self.client.table("node_commands").select("id,command,payload").eq("node_id", self.node_id).eq("status", "pending").order("id", desc=False).limit(20).execute()
+        now = datetime.now(timezone.utc).isoformat()
+        r = (
+            self.client
+            .table("node_commands")
+            .select("id,command,payload,priority,scheduled_at")
+            .eq("node_id", self.node_id)
+            .eq("status", "pending")
+            .or(f"scheduled_at.is.null,scheduled_at.lte.{now}")
+            .order("priority", desc=True)
+            .order("scheduled_at", desc=False)
+            .order("id", desc=False)
+            .limit(50)
+            .execute()
+        )
         rows = getattr(r, "data", []) or []
         for row in rows:
             if self._paused:
                 continue
             if self._running >= self._concurrency:
                 break
+            try:
+                sch = row.get("scheduled_at")
+                if sch and str(sch) > now:
+                    continue
+            except Exception:
+                pass
             try:
                 self.client.table("node_commands").update({
                     "status": "processing",
@@ -178,6 +227,18 @@ class NodeRuntime:
                         attempt += 1
                 if last_err:
                     self._log(job_id, "error", f"步骤最终失败: {str(last_err)}")
+            elif cmd == "codegen":
+                url = payload.get("url") or "https://example.com"
+                job_id = payload.get("job_id") or str(uuid.uuid4())
+                target = (payload.get("target") or "python").lower()
+                duration_sec = int(payload.get("duration_sec") or 10)
+                self._run_codegen(url, job_id, target, duration_sec)
+            elif cmd == "convert_codegen":
+                job_id = payload.get("job_id") or str(uuid.uuid4())
+                script_url = payload.get("script_url") or payload.get("url")
+                target = (payload.get("target") or "python").lower()
+                if script_url:
+                    self._run_convert_codegen(script_url, job_id, target)
         finally:
             try:
                 self.client.table("node_commands").update({
@@ -208,6 +269,7 @@ class NodeRuntime:
             self._log(job_id, "warn", "节点处于暂停状态，跳过执行")
             return
         ws = os.environ.get("PLAYWRIGHT_WS_ENDPOINT") or "ws://43.133.224.11:20001/"
+        mode = os.environ.get("BROWSER_MODE") or "remote"
         if not self.client:
             self._log(job_id, "error", "Supabase 客户端不可用")
             return
@@ -226,7 +288,15 @@ class NodeRuntime:
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                browser = p.chromium.connect(ws)
+                browser = None
+                if mode == "local":
+                    proxy = self._select_proxy(job_id)
+                    launch_args = {"headless": True}
+                    if proxy:
+                        launch_args["proxy"] = {"server": proxy}
+                    browser = p.chromium.launch(**launch_args)
+                else:
+                    browser = p.chromium.connect(ws)
                 context = browser.new_context(record_video_dir=tmpdir, record_har_path=har_path, record_har_mode="minimal")
                 context.tracing.start(screenshots=True, snapshots=True, sources=True)
                 page = context.new_page()
@@ -314,6 +384,16 @@ class NodeRuntime:
         except Exception:
             pass
 
+    def _select_proxy(self, key: str) -> Optional[str]:
+        try:
+            if not self._proxies:
+                return None
+            import hashlib
+            idx = int(hashlib.sha1(key.encode("utf-8")).hexdigest(), 16) % len(self._proxies)
+            return self._proxies[idx]
+        except Exception:
+            return None
+
     def _run_steps(self, job_id: str, url: str, steps: list, timeout_ms: int = 30000):
         self._log(job_id, "info", f"执行步骤: {len(steps)} 个, 初始页面: {url}")
         ws = os.environ.get("PLAYWRIGHT_WS_ENDPOINT") or "ws://43.133.224.11:20001/"
@@ -367,3 +447,83 @@ class NodeRuntime:
             self._log(job_id, "info", f"步骤执行完成, 标题: {title}")
             browser.close()
         self._log(job_id, "result", json.dumps({"url": url, "title": title if 'title' in locals() else None, "outputs": outputs}))
+
+    def _run_codegen(self, url: str, job_id: str, target: str = "python", duration_sec: int = 10):
+        if not self.client:
+            return
+        tmpdir = tempfile.mkdtemp(prefix=f"pm_codegen_{job_id}_")
+        script_ext = "py" if target == "python" else "js"
+        out_script = os.path.join(tmpdir, f"script.{script_ext}")
+        trace_path = os.path.join(tmpdir, "trace.zip")
+        cmd = ["python", "-m", "playwright", "codegen", url, "--target", target, "--output", out_script, "--save-trace", trace_path]
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd)
+            time.sleep(max(1, duration_sec))
+            if proc and proc.poll() is None:
+                proc.terminate()
+        except Exception as e:
+            self._log(job_id, "error", f"codegen 失败: {str(e)}")
+        try:
+            bucket = self.client.storage.from_("artifacts")
+            if os.path.exists(out_script):
+                with open(out_script, "rb") as f:
+                    bucket.upload(f"{job_id}/script.{script_ext}", f)
+                pubs = bucket.get_public_url(f"{job_id}/script.{script_ext}")
+                urls = getattr(pubs, "data", {}).get("publicUrl") or getattr(pubs, "publicURL", None) or pubs
+                self._log(job_id, "artifact", json.dumps({"type": "script", "url": urls, "target": target}))
+            if os.path.exists(trace_path):
+                with open(trace_path, "rb") as f:
+                    bucket.upload(f"{job_id}/codegen_trace.zip", f)
+                pubt = bucket.get_public_url(f"{job_id}/codegen_trace.zip")
+                urlt = getattr(pubt, "data", {}).get("publicUrl") or getattr(pubt, "publicURL", None) or pubt
+                self._log(job_id, "artifact", json.dumps({"type": "trace", "url": urlt}))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _run_convert_codegen(self, script_url: str, job_id: str, target: str = "python"):
+        import requests
+        r = requests.get(script_url, timeout=10)
+        txt = r.text
+        steps = []
+        lines = txt.splitlines()
+        if target == "python":
+            import re
+            pat = {
+                "goto": re.compile(r"page\.goto\((['\"])(.+?)\1\)"),
+                "click": re.compile(r"page\.click\((['\"])(.+?)\1\)"),
+                "fill": re.compile(r"page\.fill\((['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\)"),
+                "wait": re.compile(r"page\.wait_for_selector\((['\"])(.+?)\1\)"),
+            }
+        else:
+            import re
+            pat = {
+                "goto": re.compile(r"await\s+page\.goto\((['\"])(.+?)\1\)"),
+                "click": re.compile(r"await\s+page\.click\((['\"])(.+?)\1\)"),
+                "fill": re.compile(r"await\s+page\.fill\((['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\)"),
+                "wait": re.compile(r"await\s+page\.waitForSelector\((['\"])(.+?)\1\)"),
+            }
+        for ln in lines:
+            m = pat["goto"].search(ln)
+            if m:
+                steps.append({"action": "goto", "url": m.group(2)})
+                continue
+            m = pat["wait"].search(ln)
+            if m:
+                steps.append({"action": "wait_for_selector", "selector": m.group(2)})
+                continue
+            m = pat["click"].search(ln)
+            if m:
+                steps.append({"action": "click", "selector": m.group(2)})
+                continue
+            m = pat["fill"].search(ln)
+            if m:
+                steps.append({"action": "fill", "selector": m.group(2), "value": m.group(4)})
+                continue
+        import io, json as pyjson
+        bio = io.BytesIO(pyjson.dumps({"steps": steps}).encode("utf-8"))
+        bucket = self.client.storage.from_("artifacts")
+        bucket.upload(f"{job_id}/steps.json", bio)
+        pub = bucket.get_public_url(f"{job_id}/steps.json")
+        urlp = getattr(pub, "data", {}).get("publicUrl") or getattr(pub, "publicURL", None) or pub
+        self._log(job_id, "artifact", pyjson.dumps({"type": "steps", "url": urlp, "count": len(steps)}))

@@ -89,3 +89,15 @@ class SupabaseRepo:
         res = self.client.storage.from_(bucket).create_signed_url(path, expires)
         url = getattr(res, "signed_url", None) or getattr(res, "data", None)
         return url
+
+    def get_site_by_domain(self, domain: str) -> Optional[Dict[str, Any]]:
+        res = self.client.table("sites").select("*").eq("domain", domain).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        return data[0] if data else None
+
+    def list_exchange_rates(self) -> List[Dict[str, Any]]:
+        res = self.client.table("exchange_rates").select("*").execute()
+        return getattr(res, "data", None) or []
+
+    def upsert_exchange_rate(self, currency: str, rate_to_usd: float) -> None:
+        self.client.table("exchange_rates").upsert({"currency": currency, "rate_to_usd": rate_to_usd}, on_conflict="currency").execute()

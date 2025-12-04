@@ -1,7 +1,7 @@
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-from spider.main import init_db, create_product, get_product, get_conn, system_status, create_task, execute_task, listing, TaskCreate, ListingRequest, export_product_prices, export_products
+from spider.main import init_db, create_product, get_product, get_conn, system_status, create_task, execute_task, listing, TaskCreate, ListingRequest, export_product_prices, export_products, export_products_xlsx
 
 
 def test_init_db_and_create_product():
@@ -71,3 +71,17 @@ def test_multi_export_csv_contains_multiple_products():
     assert getattr(resp, "media_type", None) == "text/csv"
     assert "商品C".encode("utf-8") in content
     assert "商品D".encode("utf-8") in content
+
+
+def test_multi_export_xlsx_response_headers():
+    init_db()
+    pid1 = create_product("商品E", "http://example.com/e", "类目")
+    pid2 = create_product("商品F", "http://example.com/f", "类目")
+    t1 = create_task(TaskCreate(product_id=pid1))["data"]["id"]
+    t2 = create_task(TaskCreate(product_id=pid2))["data"]["id"]
+    execute_task(t1)
+    execute_task(t2)
+    resp = export_products_xlsx(f"{pid1},{pid2}")
+    assert getattr(resp, "media_type", None) == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    dispo = resp.headers.get("content-disposition", "")
+    assert "products_export.xlsx" in dispo
