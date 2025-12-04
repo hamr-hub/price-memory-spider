@@ -31,6 +31,13 @@ class BowserBrowser:
         self._async_playwright = None
         self._browser = None
         self._page = None
+        self._user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        ]
+        self._locales = ["zh-CN", "en-US"]
+        self._timezones = ["Asia/Shanghai", "UTC"]
+        self._max_retries = 2
     
     # ========== 同步方法 ==========
     
@@ -46,10 +53,11 @@ class BowserBrowser:
         with sync_playwright() as p:
             try:
                 browser = p.chromium.connect(self.ws_endpoint)
-                context = browser.new_context()
+                context = browser.new_context(**self._build_context_args())
                 page = context.new_page()
                 page.set_default_timeout(timeout)
-                page.goto(url)
+                self._apply_stealth(page)
+                self._navigate_with_retry(page, url, timeout)
                 func(page)
                 browser.close()
             except Exception as e:
@@ -74,11 +82,12 @@ class BowserBrowser:
             self._browser = self._sync_playwright.chromium.connect(self.ws_endpoint)
         
         if not self._page:
-            context = self._browser.new_context()
+            context = self._browser.new_context(**self._build_context_args())
             self._page = context.new_page()
         
         self._page.set_default_timeout(timeout)
-        self._page.goto(url)
+        self._apply_stealth(self._page)
+        self._navigate_with_retry(self._page, url, timeout)
         return self._page
     
     def close_sync(self):
@@ -107,10 +116,11 @@ class BowserBrowser:
         async with async_playwright() as p:
             try:
                 browser = await p.chromium.connect_async(self.ws_endpoint)
-                context = await browser.new_context()
+                context = await browser.new_context(**self._build_context_args())
                 page = await context.new_page()
                 await page.set_default_timeout(timeout)
-                await page.goto(url)
+                await self._apply_stealth_async(page)
+                await self._navigate_with_retry_async(page, url, timeout)
                 
                 if asyncio.iscoroutinefunction(func):
                     await func(page)
@@ -140,11 +150,12 @@ class BowserBrowser:
             self._browser = await self._async_playwright.chromium.connect_async(self.ws_endpoint)
         
         if not self._page:
-            context = await self._browser.new_context()
+            context = await self._browser.new_context(**self._build_context_args())
             self._page = await context.new_page()
         
         await self._page.set_default_timeout(timeout)
-        await self._page.goto(url)
+        await self._apply_stealth_async(self._page)
+        await self._navigate_with_retry_async(self._page, url, timeout)
         return self._page
     
     async def close_async(self):
@@ -205,6 +216,55 @@ class BowserBrowser:
         else:
             # 同步模式
             return page.screenshot(path=path)
+
+    def _build_context_args(self) -> Dict[str, Any]:
+        import random
+        ua = random.choice(self._user_agents)
+        loc = random.choice(self._locales)
+        tz = random.choice(self._timezones)
+        headers = {"Accept-Language": loc}
+        return {
+            "user_agent": ua,
+            "locale": loc,
+            "timezone_id": tz,
+            "extra_http_headers": headers,
+        }
+
+    def _apply_stealth(self, page: SyncPage):
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+
+    async def _apply_stealth_async(self, page: AsyncPage):
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+
+    def _navigate_with_retry(self, page: SyncPage, url: str, timeout: int):
+        import random, time as _t
+        tries = 0
+        last = None
+        while tries <= self._max_retries:
+            try:
+                page.goto(url, timeout=timeout)
+                return
+            except Exception as e:
+                last = e
+                _t.sleep(0.2 + random.random())
+                tries += 1
+        if last:
+            raise last
+
+    async def _navigate_with_retry_async(self, page: AsyncPage, url: str, timeout: int):
+        import random, asyncio as _a
+        tries = 0
+        last = None
+        while tries <= self._max_retries:
+            try:
+                await page.goto(url, timeout=timeout)
+                return
+            except Exception as e:
+                last = e
+                await _a.sleep(0.2 + random.random())
+                tries += 1
+        if last:
+            raise last
 
 
 # ========== 装饰器 ==========
