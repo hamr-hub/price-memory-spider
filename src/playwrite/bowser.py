@@ -1,11 +1,99 @@
-from playwright.sync_api import sync_playwright
-from playwright.async_api import async_playwright
+"""
+Playwright浏览器工具类
+提供统一的浏览器操作接口
+"""
+import os
+import time
+import tempfile
+import shutil
 import json
 import asyncio
+from typing import Optional, Callable, Any, Dict, List
 from urllib.parse import urlparse
-from typing import Callable, Any
-from src.utils.url_util import get_link_latency
+from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
+from playwright.async_api import async_playwright
 
+try:
+    from ..config.config import config
+except ImportError:
+    # 兼容性处理
+    class Config:
+        PLAYWRIGHT_WS_ENDPOINT = "ws://43.133.224.11:20001/"
+        BROWSER_MODE = "remote"
+        @classmethod
+        def get_proxy_list(cls):
+            return []
+    config = Config()
+
+try:
+    from ..utils.url_util import get_link_latency
+except ImportError:
+    def get_link_latency(browser, page, url):
+        return 0.0
+
+
+class BowserBrowser:
+    """浏览器管理类"""
+    
+    def __init__(self, ws_endpoint: Optional[str] = None, headless: bool = True):
+        self.ws_endpoint = ws_endpoint or config.PLAYWRIGHT_WS_ENDPOINT
+        self.headless = headless
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+    
+    def open_page_sync(self, url: str, timeout: int = 30000) -> Page:
+        """同步方式打开页面"""
+        with sync_playwright() as p:
+            if config.BROWSER_MODE == "local":
+                # 本地模式
+                proxy_config = self._get_proxy_config()
+                launch_args = {"headless": self.headless}
+                if proxy_config:
+                    launch_args["proxy"] = proxy_config
+                
+                self.browser = p.chromium.launch(**launch_args)
+            else:
+                # 远程模式
+                self.browser = p.chromium.connect(self.ws_endpoint)
+            
+            self.context = self.browser.new_context()
+            self.page = self.context.new_page()
+            self.page.set_default_timeout(timeout)
+            self.page.goto(url)
+            
+            return self.page
+    
+    def close_sync(self):
+        """同步关闭浏览器"""
+        try:
+            if self.page:
+                self.page.close()
+            if self.context:
+                self.context.close()
+            if self.browser:
+                self.browser.close()
+        except Exception:
+            pass
+        finally:
+            self.page = None
+            self.context = None
+            self.browser = None
+    
+    def _get_proxy_config(self) -> Optional[Dict[str, str]]:
+        """获取代理配置"""
+        proxies = config.get_proxy_list()
+        if not proxies:
+            return None
+        
+        # 简单轮询选择代理
+        import hashlib
+        import time
+        key = str(int(time.time() / 60))  # 每分钟轮换
+        idx = int(hashlib.sha1(key.encode()).hexdigest(), 16) % len(proxies)
+        proxy_url = proxies[idx]
+        
+        return {"server": proxy_url}
 
 
 def run(url: str, func: Callable[[Any], None], headless: bool = False, timeout: int = 30000) -> None:
@@ -21,17 +109,15 @@ def run(url: str, func: Callable[[Any], None], headless: bool = False, timeout: 
     Returns:
         None
     """
-    with sync_playwright() as p:
-        try:
-            browser = p.chromium.connect("ws://43.133.224.11:20001/")
-            page = browser.new_page()
-            page.set_default_timeout(timeout)
-            page.goto(url)
-            func(page)
-            browser.close()
-        except Exception as e:
-            print(f"同步执行失败: {e}")
-            raise
+    browser = BowserBrowser(headless=headless)
+    try:
+        page = browser.open_page_sync(url, timeout)
+        func(page)
+    except Exception as e:
+        print(f"同步执行失败: {e}")
+        raise
+    finally:
+        browser.close_sync()
 
 
 async def run_async(url: str, func: Callable[[Any], Any], headless: bool = False, timeout: int = 30000) -> None:
@@ -49,7 +135,7 @@ async def run_async(url: str, func: Callable[[Any], Any], headless: bool = False
     """
     async with async_playwright() as p:
         try:
-            browser = await p.chromium.connect_async("ws://43.133.224.11:20001/")
+            browser = await p.chromium.connect_async(config.PLAYWRIGHT_WS_ENDPOINT)
             context = await browser.new_context()
             page = await context.new_page()
             await page.set_default_timeout(timeout)

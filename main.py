@@ -1,27 +1,49 @@
+"""
+FastAPI应用主入口文件 - 兼容版本
+保持与原有main.py的兼容性，同时使用新的模块化结构
+"""
 import os
-import math
-import datetime
-import random
-from typing import Any, List, Optional, Dict
-from fastapi import FastAPI, APIRouter, Query, Header
-from fastapi.responses import Response, JSONResponse
-from fastapi import Body
-import secrets
-from pydantic import BaseModel
 import sys
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+# 添加src目录到Python路径
 BASE_DIR = os.path.dirname(__file__)
-DB_PATH = os.path.join(BASE_DIR, "spider.db")
-from dotenv import load_dotenv
-load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+src_path = os.path.join(BASE_DIR, "src")
+if src_path not in sys.path:
+    sys.path.append(src_path)
+
+# 导入新的模块化组件
 try:
-    src_path = os.path.join(BASE_DIR, "src")
-    if src_path not in sys.path:
-        sys.path.append(src_path)
+    from src.main import app as new_app
+    # 如果新的模块化应用可用，使用它
+    app = new_app
+except ImportError:
+    # 如果新模块不可用，回退到原有实现
+    from src.config.config import config
     from src.dao.supabase_client import get_client
-    SB = get_client()
-except Exception:
-    SB = None
+    
+    # 创建FastAPI应用
+    app = FastAPI(
+        title="Price Memory API",
+        description="价格记忆 - 商品价格监控与分析API",
+        version="1.0.0"
+    )
+    
+    # 添加CORS中间件
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # 初始化数据库连接
+    try:
+        SB = get_client()
+    except Exception:
+        SB = None
 
 def get_auth_uid(user_id: int) -> Optional[str]:
     if not SB:
