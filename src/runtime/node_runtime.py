@@ -40,6 +40,8 @@ class NodeRuntime:
         except Exception:
             self._concurrency = 1
         self._running = 0
+        self._auto_consume = False
+        self._queue_thread = None
 
     def start(self):
         if not self.client:
@@ -50,7 +52,8 @@ class NodeRuntime:
         threading.Thread(target=self._retry_loop, daemon=True).start()
         try:
             if str(os.environ.get("AUTO_CONSUME_QUEUE") or "").lower() in {"1","true","yes"}:
-                threading.Thread(target=self._queue_loop, daemon=True).start()
+                self._auto_consume = True
+                self._maybe_start_queue()
         except Exception:
             pass
 
@@ -113,12 +116,16 @@ class NodeRuntime:
         if not self.client or not self.node_id:
             return
         try:
-            rs = self.client.table("runtime_nodes").select("concurrency").eq("id", self.node_id).limit(1).execute()
+            rs = self.client.table("runtime_nodes").select("concurrency,auto_consume").eq("id", self.node_id).limit(1).execute()
             data = getattr(rs, "data", []) or []
             if data:
                 c = int((data[0] or {}).get("concurrency") or 0)
                 if c > 0:
                     self._concurrency = c
+                ac = bool((data[0] or {}).get("auto_consume"))
+                if ac != self._auto_consume:
+                    self._auto_consume = ac
+                    self._maybe_start_queue()
         except Exception:
             pass
 
@@ -238,6 +245,11 @@ class NodeRuntime:
                     }).eq("id", self.node_id).execute()
                 except Exception:
                     pass
+            elif cmd == "consume_enable":
+                self._auto_consume = True
+                self._maybe_start_queue()
+            elif cmd == "consume_disable":
+                self._auto_consume = False
             elif cmd == "test_crawl":
                 url = payload.get("url") or "https://example.com"
                 job_id = payload.get("job_id") or str(uuid.uuid4())
@@ -490,7 +502,7 @@ class NodeRuntime:
         base = os.environ.get("API_BASE_URL") or "http://127.0.0.1:8000/api/v1"
         while not self._stop:
             try:
-                if self._paused:
+                if self._paused or not self._auto_consume:
                     time.sleep(2)
                     continue
                 import urllib.request
@@ -507,6 +519,13 @@ class NodeRuntime:
             except Exception:
                 time.sleep(2)
             time.sleep(2)
+    def _maybe_start_queue(self):
+        try:
+            if self._auto_consume and (self._queue_thread is None or not self._queue_thread.is_alive()):
+                self._queue_thread = threading.Thread(target=self._queue_loop, daemon=True)
+                self._queue_thread.start()
+        except Exception:
+            pass
     def _select_proxy(self, key: str) -> Optional[str]:
         try:
             if not self._proxies:
