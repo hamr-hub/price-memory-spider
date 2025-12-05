@@ -1,0 +1,142 @@
+groups:
+  - name: price-memory-alerts
+    rules:
+      # API服务可用性告警
+      - alert: APIDown
+        expr: up{job="price-memory-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Price Memory API服务不可用"
+          description: "Price Memory API服务已停止运行超过30秒"
+
+      # API响应时间告警
+      - alert: APIHighResponseTime
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="price-memory-api"}[5m])) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API响应时间过高"
+          description: "API 95%分位响应时间超过2秒"
+
+      # API错误率告警
+      - alert: APIHighErrorRate
+        expr: rate(http_requests_total{job="price-memory-api",status=~"5.."}[5m]) / rate(http_requests_total{job="price-memory-api"}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API错误率过高"
+          description: "API错误率超过5%"
+
+      # 任务队列积压告警
+      - alert: TaskQueueBacklog
+        expr: price_memory_pending_tasks > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "任务队列积压"
+          description: "待处理任务数量超过100个"
+
+      # 任务失败率告警
+      - alert: TaskHighFailureRate
+        expr: rate(price_memory_task_failures_total[1h]) / rate(price_memory_task_total[1h]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "任务失败率过高"
+          description: "任务失败率超过10%"
+
+      # 浏览器服务不可用
+      - alert: BrowserServiceDown
+        expr: up{job="playwright-browser"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "浏览器服务不可用"
+          description: "Playwright浏览器服务已停止运行"
+
+      # Redis连接数告警
+      - alert: RedisHighConnections
+        expr: redis_connected_clients > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis连接数过高"
+          description: "Redis连接数超过50个"
+
+      # Redis内存使用率告警
+      - alert: RedisHighMemoryUsage
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis内存使用率过高"
+          description: "Redis内存使用率超过80%"
+
+      # 系统CPU使用率告警
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU使用率过高"
+          description: "CPU使用率超过80%"
+
+      # 系统内存使用率告警
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "内存使用率超过85%"
+
+      # 磁盘空间告警
+      - alert: DiskSpaceLow
+        expr: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "磁盘空间不足"
+          description: "磁盘使用率超过90%"
+
+      # 容器重启告警
+      - alert: ContainerRestarted
+        expr: rate(container_start_time_seconds[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "容器重启"
+          description: "容器在5分钟内重启了"
+
+      # 价格抓取成功率告警
+      - alert: LowScrapingSuccessRate
+        expr: rate(price_memory_scraping_success_total[1h]) / rate(price_memory_scraping_total[1h]) < 0.7
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "价格抓取成功率过低"
+          description: "价格抓取成功率低于70%"
+
+      # 数据库连接数告警
+      - alert: DatabaseConnectionsHigh
+        expr: price_memory_db_connections_active / price_memory_db_connections_max > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据库连接数过高"
+          description: "数据库活跃连接数超过最大连接数的80%"
